@@ -69,14 +69,20 @@ def get_safe_wandb_artifact_name(name: str):
 
 
 class WandBLogger:
-    """A helper class to log object using wandb."""
+    """A helper class to log object using wandb or swanlab."""
 
     def __init__(self, cfg: TrainPipelineConfig):
         self.cfg = cfg.wandb
+        self.backend = getattr(self.cfg, "backend", "wandb") or "wandb"
         self.log_dir = cfg.output_dir
         self.job_name = cfg.job_name
         self.env_fps = None
         self._group = cfg_to_group(cfg)
+        self._wandb_custom_step_key: set[str] | None = None
+
+        if self.backend == "swanlab":
+            self._init_swanlab(cfg)
+            return
 
         # Set up WandB.
         os.environ["WANDB_SILENT"] = "True"
@@ -110,7 +116,7 @@ class WandBLogger:
         # This is because we want to be able to resume the run from the wandb run id.
         cfg.wandb.run_id = run_id
         # Handle custom step key for rl asynchronous training.
-        self._wandb_custom_step_key: set[str] | None = None
+        self._wandb_custom_step_key = None
         logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
         if wandb.run.get_url():
             url = wandb.run.get_url()
@@ -119,9 +125,39 @@ class WandBLogger:
         logging.info(f"Track this run --> {colored(url, 'yellow', attrs=['bold'])}")
         self._wandb = wandb
 
+    def _init_swanlab(self, cfg: TrainPipelineConfig):
+        import swanlab
+
+        mode_map = {
+            "online": "cloud",
+            "cloud": "cloud",
+            "offline": "local",
+            "local": "local",
+            "disabled": "disabled",
+        }
+        swanlab_mode = mode_map.get(self.cfg.mode, "cloud") if self.cfg.mode else "cloud"
+        api_key = os.environ.get("SWANLAB_API_KEY")
+        if api_key and swanlab_mode == "cloud":
+            try:
+                swanlab.login(api_key=api_key)
+            except Exception as exc:
+                logging.warning("swanlab.login failed (%s); continuing.", exc)
+
+        swanlab.init(
+            project=self.cfg.project,
+            workspace=self.cfg.entity,
+            experiment_name=self.job_name,
+            description=self.cfg.notes,
+            config=cfg.to_dict(),
+            logdir=str(Path(self.log_dir) / "swanlab") if self.log_dir else None,
+            mode=swanlab_mode,
+        )
+        logging.info(colored("Logs will be synced with swanlab.", "blue", attrs=["bold"]))
+        self._wandb = swanlab
+
     def log_policy(self, checkpoint_dir: Path):
-        """Checkpoints the policy to wandb."""
-        if self.cfg.disable_artifact:
+        """Checkpoints the policy to wandb (no-op for swanlab)."""
+        if self.cfg.disable_artifact or self.backend == "swanlab":
             return
 
         step_id = checkpoint_dir.name

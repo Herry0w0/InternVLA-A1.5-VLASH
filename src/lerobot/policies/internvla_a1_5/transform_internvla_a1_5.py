@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -72,6 +73,10 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
 
     tokenize_state: bool = True
     max_state_dim: int = 32
+    norm_mode: str = "mean_std"
+    state_dropout_prob: float = 0.0
+    vlash_condition_on_delay: bool = False
+    eval_output_tag: str = "<Subtask, Action>"
 
     use_fast_action_tokens: bool = True
     action_text_key: str = "action.action_text"
@@ -95,27 +100,45 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
     def _encode_state(self, data: DataDict) -> str:
         if not self.tokenize_state or OBS_STATE not in data:
             return ""
+        delay_val = data.get("vlash_delay_steps", 0)
+        delay = int(delay_val.item()) if isinstance(delay_val, torch.Tensor) else int(delay_val)
+        if self.mode == "train" and self.state_dropout_prob > 0.0 and delay == 0:
+            if random.random() < self.state_dropout_prob:
+                return ""
         state = deepcopy(data[OBS_STATE])
         state = pad_vector(state, self.max_state_dim)
-        state_np = state.cpu().numpy() / 3
+        scale = 3.0 if self.norm_mode == "mean_std" else 1.0
+        state_np = np.clip(state.cpu().numpy() / scale, -1.0, 1.0 - 1e-6)
         discretized = np.digitize(state_np, bins=np.linspace(-1, 1, 257)[:-1]) - 1
         return "State: " + " ".join(map(str, discretized))
 
     def __call__(self, data: DataDict) -> DataDict:
         state_str = self._encode_state(data)
 
+        # Preserve chronological order if a 4th history frame (image3 = head_prev) is present:
+        # [image3 (head_prev), image0 (head_curr), image1 (left_wrist), image2 (right_wrist)].
+        view_order = (
+            [3, 0, 1, 2]
+            if (self.num_views >= 4 and f"{OBS_IMAGES}.image3" in data)
+            else list(range(self.num_views))
+        )
         images, valid_image_indices = [], []
-        for i in range(self.num_views):
-            k = f"{OBS_IMAGES}.image{i}"
-            if bool(data[f"{k}_mask"]):
+        for slot_idx, view_id in enumerate(view_order):
+            k = f"{OBS_IMAGES}.image{view_id}"
+            mask_k = f"{k}_mask"
+            if k in data and bool(data.get(mask_k, True)):
                 images.append(data[k])
-                valid_image_indices.append(i)
+                valid_image_indices.append(slot_idx)
 
         user_text = "Task: " + str(data.get(self.task_key, ""))
         lang_mem = str(data.get(self.language_memory_key, "")).strip()
         if lang_mem:
             user_text = user_text + "; " + lang_mem
         user_text = user_text + "; " + f"Control Mode: <{self.action_mode}>"
+        if self.vlash_condition_on_delay:
+            delay_val = data.get("vlash_delay_steps", 0)
+            delay = int(delay_val.item()) if isinstance(delay_val, torch.Tensor) else int(delay_val)
+            user_text = user_text + f"; Delay: {delay}"
         if self.tokenize_state and state_str:
             user_text = user_text + "; " + state_str
 
@@ -139,7 +162,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
             label_mode = LABEL_MODE_NONE
         if self.mode == "eval":
             label_mode = LABEL_MODE_NONE
-            user_text = user_text + "; Output: <Subtask, Action>"
+            user_text = user_text + f"; Output: {self.eval_output_tag}"
 
         # Build assistant text
         if label_mode == LABEL_MODE_BOTH:
@@ -636,9 +659,23 @@ class ExtractVideoFramesTransformFn(DataTransformFn):
 
     source_view: str = f"{OBS_IMAGES}.image0"
     video_key: str = "observation.video_frames"
+    raw_video_key: str = "observation.video_frames_raw"
     normalize_to_minus1_1: bool = True
+    video_height: int = 224
+    video_width: int = 224
 
     def __call__(self, data: DataDict) -> DataDict:
+        if self.raw_video_key in data:
+            from lerobot.transforms.utils import resize_with_pad
+
+            video = data.pop(self.raw_video_key)
+            if video.shape[-2:] != (self.video_height, self.video_width):
+                video = resize_with_pad(video, self.video_height, self.video_width)
+            if self.normalize_to_minus1_1:
+                video = video * 2.0 - 1.0
+            data[self.video_key] = video
+            return data
+
         src = data[self.source_view]
         if src.ndim == 4:  # [T, C, H, W]
             video = src
@@ -646,7 +683,7 @@ class ExtractVideoFramesTransformFn(DataTransformFn):
                 video = video * 2.0 - 1.0
             data[self.video_key] = video
 
-            for i in range(3):
+            for i in range(4):
                 k = f"{OBS_IMAGES}.image{i}"
                 if k in data and data[k].ndim == 4:
                     data[k] = data[k][0]

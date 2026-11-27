@@ -1,0 +1,150 @@
+# ============================================================================
+# InternVLA-A1.5 + VLASH 动态传送带翻包训练配置（16 维 Delta + 3 相机 + 显式延迟条件）
+# ============================================================================
+# 维度顺序（与 InternVLA-A1.5 预训练双臂先验完全对齐，左臂在前、右臂在后）：
+#   left_arm(7) [0:7] + left_gripper(1) [7:8] + right_arm(7) [8:15] + right_gripper(1) [15:16]
+# 数据集路径: /mnt/data3/jiangxirui/dynamic_rigid_parcel_flip_internvla_lerobot_v3_rel30
+# 模型权重:   /mnt/data3/InternVLA-A1.5-base + /mnt/data3/Wan2.2-TI2V-5B
+#             + /mnt/data3/Qwen3.5-2B + /mnt/data3/fast_tokenizer
+# ============================================================================
+
+dataset:
+  type: internvla_a1_5
+  repo_id: local/dynamic_parcel_flip
+  root: /mnt/data3/jiangxirui/dynamic_rigid_parcel_flip_internvla_lerobot_v3_rel30
+  episodes: null
+  video_backend: pyav
+  use_imagenet_stats: false
+  use_external_stats: false
+  action_mode: delta
+  norm_mode: mean_std             # 与 InternVLA-A1.5-base 预训练保持一致（配合静止维度 min_std 保护）
+  state_dropout_prob: 0.1         # 仅在 δ=0 时随机丢弃本体状态，δ>0 永不丢弃
+
+  # ---- 空间分辨率与 3 路相机输入（保持 3 视角以最小化 Jetson Orin 推理延迟）----
+  height: 224
+  width: 224
+  video_height: 224
+  video_width: 224
+  num_video_frames: 4
+  chunk_size: 30
+  max_state_dim: 32
+  max_action_dim: 32
+  max_prompt_length: 650
+  tokenize_state: true
+  use_fast_action_tokens: true
+  eval_output_tag: "<Action>"     # 与无 subtask 时的训练提示词 "; Output: <Action>" 严格一致
+  vlm_model_name_or_path: /mnt/data3/Qwen3.5-2B
+  fast_tokenizer_path: /mnt/data3/fast_tokenizer
+
+  # ---- VLASH 时移微调 + 显式延迟条件 + 固定跨度 WAN 前瞻 ----
+  vlash_enabled: true
+  vlash_min_delay_steps: 1        # Orin 实测真实延迟后可围绕实测值收窄 [min, max]
+  vlash_max_delay_steps: 12       # 30Hz 下覆盖最高 400ms 推理延迟
+  vlash_zero_delay_prob: 0.1      # 10% 概率 δ=0（贴近原论文均匀分布并保留冷启动），90% 均匀采样 [min, max]
+  vlash_condition_on_delay: true  # 在 VLM 提示词中显式注入 "; Delay: <δ>"，解决静态臂拦截动态包裹的不可辨识性
+  wan_video_span_steps: 42        # 固定 42 帧（chunk_size+max_delay）WAN 未来视频跨度，不随 δ 随机拉伸
+  enable_head_history: false      # 沿用标准 3 路相机（head_right / left_arm / right_arm），避免 +33% VLM 延迟
+  head_history_gap: 4
+  head_camera_key: observation.images.head_right
+  letterbox_pad_px: 28            # 3 路 Galbot 相机均为 4:3 (640x480 -> 224x168 + 上下各 28px)，显式 28px 彻底避免 H.264 YUV420p 振铃误检
+
+  # ---- Letterbox 安全版光度增强（禁用 contrast 与 affine）----
+  image_transforms:
+    enable: true
+    max_num_transforms: 2
+    random_order: false
+    tfs:
+      brightness:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.85, 1.15]
+      saturation:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          saturation: [0.8, 1.2]
+      hue:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          hue: [-0.03, 0.03]
+      sharpness:
+        type: SharpnessJitter
+        weight: 0.5
+        kwargs:
+          sharpness: [0.7, 1.3]
+
+policy:
+  type: internvla_a1_5
+  repo_id: local/internvla_a15_vlash_conveyor
+  pretrained_path: /mnt/data3/InternVLA-A1.5-base
+  vlm_model_name_or_path: /mnt/data3/Qwen3.5-2B
+  push_to_hub: false
+
+  # ---- 模型与动作空间 ----
+  dtype: bfloat16
+  image_resolution: [224, 224]
+  chunk_size: 30
+  n_action_steps: 30
+  max_state_dim: 32
+  max_action_dim: 32
+  num_inference_steps: 10
+  gradient_checkpointing: true    # 同时对 Qwen3.5、Action Expert 与 WAN2.2 DiT blocks 生效，防单卡 OOM
+  use_sdpa: false                 # 与官方启动脚本保持一致，确保 bf16 下 -2.38e38 浮点 mask 数值稳定
+
+  # ---- 动作 Loss 掩码（屏蔽尾部填充步 + 降低 16..31 维补零通道稀释）----
+  mask_action_pad: true           # 屏蔽 episode 尾部重复 clamp 的 action_is_pad 时间步
+  padded_action_dim_weight: 0.1   # 实维 [0:16] 权重 1.0，补零维 [16:32] 保留 0.1 弱锚定防止 ODE 漂移
+
+  # ---- 冻结与监督分支 ----
+  freeze_vision_encoder: false
+  train_expert_only: false
+  enable_vqa_loss: true
+  lambda_vqa: 1.0
+  tokenize_state: true
+  knowledge_insulation: false
+
+  # ---- WAN2.2-5B 潜空间前瞻联合监督（推理时丢弃 WAN2.2）----
+  wan_checkpoint_path: /mnt/data3/Wan2.2-TI2V-5B
+  wan_config_path: /mnt/data3/Wan2.2-TI2V-5B
+  vae_path: /mnt/data3/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  video_precision: bfloat16
+  freeze_wan_dit: true
+  num_video_frames: 4
+  video_height: 224
+  video_width: 224
+  video_loss_weight: 1.0
+  video_loss_only: false
+  action_loss_only: false
+  freeze_learnable_tokens: false  # 固定 WAN 跨度后可安全微调 50 个前瞻查询 token 适配动态传送带场景
+  num_learnable_tokens: 50
+
+  # ---- 优化器与学习率调度（单卡 BS=8 默认 lr=2.5e-5；若 4 卡 BS=32 可通过 CLI 覆盖为 5e-5）----
+  optimizer_lr: 2.5e-5
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-8
+  optimizer_weight_decay: 0.01
+  optimizer_grad_clip_norm: 1.0
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-6
+
+output_dir: /mnt/data3/jiangxirui/train_outputs/internvla_a15_vlash_conveyor
+job_name: internvla_a15_vlash_conveyor_delta_3cam
+
+seed: 42
+batch_size: 8
+num_workers: 8
+steps: 30000
+log_freq: 50
+# 注意: lerobot_train.py 当前不包含在线评估循环，离线开环评估请使用 tests/openloop_internvla_a1_5.py
+save_freq: 5000
+save_checkpoint: true
+use_policy_training_preset: true
+
+wandb:
+  enable: true
+  backend: swanlab
+  project: internvla-a15-vlash-package-flip
+  mode: online

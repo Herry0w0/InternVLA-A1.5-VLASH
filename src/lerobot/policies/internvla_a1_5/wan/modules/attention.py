@@ -59,6 +59,59 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    if not FLASH_ATTN_3_AVAILABLE and not FLASH_ATTN_2_AVAILABLE:
+        v_t = half(v)
+        q_t = half(q).to(v_t.dtype)
+        k_t = half(k).to(v_t.dtype)
+        if q_scale is not None:
+            q_t = q_t * q_scale
+
+        attn_mask = None
+        if k_lens is not None:
+            k_mask = (
+                torch.arange(lk, device=q_t.device)[None, :]
+                < k_lens.to(q_t.device)[:, None]
+            )
+            attn_mask = k_mask[:, None, None, :].expand(b, 1, lq, lk)
+        if window_size is not None and window_size != (-1, -1):
+            w_left, w_right = window_size
+            q_pos = torch.arange(lq, device=q_t.device)[:, None]
+            k_pos = torch.arange(lk, device=q_t.device)[None, :]
+            win_mask = torch.ones((lq, lk), dtype=torch.bool, device=q_t.device)
+            if w_left >= 0:
+                win_mask &= k_pos >= (q_pos - w_left)
+            if w_right >= 0:
+                win_mask &= k_pos <= (q_pos + w_right)
+            win_mask = win_mask[None, None, :, :]
+            attn_mask = win_mask if attn_mask is None else (attn_mask & win_mask)
+        if causal and attn_mask is not None:
+            causal_mask = torch.tril(
+                torch.ones((lq, lk), dtype=torch.bool, device=q_t.device)
+            )[None, None, :, :]
+            attn_mask = attn_mask & causal_mask
+            causal_arg = False
+        else:
+            causal_arg = causal
+
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q_t.transpose(1, 2),
+            k_t.transpose(1, 2),
+            v_t.transpose(1, 2),
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=causal_arg,
+            scale=softmax_scale,
+            enable_gqa=(q_t.size(2) != k_t.size(2)),
+        ).transpose(1, 2).contiguous()
+
+        if q_lens is not None:
+            q_mask = (
+                torch.arange(lq, device=x.device)[None, :]
+                < q_lens.to(x.device)[:, None]
+            )
+            x = x * q_mask[:, :, None, None].to(x.dtype)
+        return x.type(out_dtype)
+
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
@@ -108,8 +161,7 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
-    else:
-        assert FLASH_ATTN_2_AVAILABLE
+    elif FLASH_ATTN_2_AVAILABLE:
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -125,6 +177,11 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
+    else:
+        # Pure PyTorch SDPA fallback when flash_attn / flash_attn_interface is not installed.
+        # Reshape back from flattened packed representation or reconstruct padded [B, L, N, C]
+        # from original lens if variable length was passed.
+        raise RuntimeError("unreachable: handled before flattening")
 
     # output
     return x.type(out_dtype)

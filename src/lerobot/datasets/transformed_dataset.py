@@ -29,8 +29,10 @@ class TransformedLeRobotDataset(LeRobotDataset):
         *,
         share_dict: bool = True,
     ) -> TransformedLeRobotDataset:
-        obj = cls.__new__(cls)  
-        obj.__dict__ = (base.__dict__ if share_dict else base.__dict__.copy())
+        obj = cls.__new__(cls)
+        use_subclass_delegate = type(base) is not LeRobotDataset
+        obj.__dict__ = (base.__dict__ if (share_dict and not use_subclass_delegate) else base.__dict__.copy())
+        obj._base_dataset = base if use_subclass_delegate else None
 
         transforms = [t.hydrate(obj) for t in transforms]
 
@@ -73,7 +75,11 @@ class TransformedLeRobotDataset(LeRobotDataset):
         return cls.from_base(base, transforms=transforms, share_dict=share_dict)
 
     def __getitem__(self, idx: int) -> DataDict:
-        sample = super().__getitem__(idx)
+        base_ds = getattr(self, "_base_dataset", None)
+        if base_ds is not None:
+            sample = base_ds[idx]
+        else:
+            sample = super().__getitem__(idx)
         sample = self._transform(sample)
         if isinstance(sample, dict):
             sample["repo_id"] = self.repo_id

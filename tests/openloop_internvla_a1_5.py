@@ -388,13 +388,17 @@ def main() -> None:
 
     dataset, _ = make_dataset(cfg)
 
-    act_unnorm_fn = make_unnorm_fn(dataset, ACTION, ACTION_STAT_KEYS, DEFAULT_NORM_MODE)
-    state_unnorm_fn = make_unnorm_fn(dataset, OBS_STATE, STATE_STAT_KEYS, DEFAULT_NORM_MODE)
+    norm_mode = getattr(cfg.dataset, "norm_mode", DEFAULT_NORM_MODE)
+    act_unnorm_fn = make_unnorm_fn(dataset, ACTION, ACTION_STAT_KEYS, norm_mode)
+    state_unnorm_fn = make_unnorm_fn(dataset, OBS_STATE, STATE_STAT_KEYS, norm_mode)
 
     from_ids = np.asarray(dataset.meta.episodes["dataset_from_index"]).tolist()
     to_ids = np.asarray(dataset.meta.episodes["dataset_to_index"]).tolist()
     num_episodes = min(dataset.num_episodes, args.num_episodes)
     stride = config.chunk_size
+    is_galbot_7dof = getattr(dataset.meta, "robot_type", None) == "galbot_one_golf"
+    joint_slice_indices = list(range(0, 7)) + list(range(8, 15)) if is_galbot_7dof else list(range(0, 6)) + list(range(7, 13))
+    gripper_slice_indices = [7, 15] if is_galbot_7dof else [6, 13]
 
     output_dir = args.out_dir
     (output_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -445,10 +449,15 @@ def main() -> None:
                 torch.cuda.synchronize()
             elapse_time += time.perf_counter() - start_time
 
-            action_pred = compact_a1_dims(action_pred[0]).to(dtype=torch.float32)
-            chunk_size = config.chunk_size
-            action_gt = compact_a1_dims(sample[ACTION][:chunk_size].to(device=device))
-            action_gt = action_gt.to(dtype=torch.float32)
+            if is_galbot_7dof:
+                action_pred = action_pred[0, :, :16].to(dtype=torch.float32)
+                chunk_size = config.chunk_size
+                action_gt = sample[ACTION][:chunk_size, :16].to(device=device, dtype=torch.float32)
+            else:
+                action_pred = compact_a1_dims(action_pred[0]).to(dtype=torch.float32)
+                chunk_size = config.chunk_size
+                action_gt = compact_a1_dims(sample[ACTION][:chunk_size].to(device=device))
+                action_gt = action_gt.to(dtype=torch.float32)
 
             valid_steps = min(action_pred.shape[0], action_gt.shape[0])
             action_pred_list.append(action_pred[:valid_steps].clone())
@@ -456,9 +465,8 @@ def main() -> None:
 
             if action_mode == "delta":
                 state = sample[OBS_STATE].clone().repeat(valid_steps, 1).to(device=device)
-                state = compact_a1_dims(state).to(dtype=torch.float32)
-                state[:, 6] *= 0.0
-                state[:, 13] *= 0.0
+                state = (state[..., :16] if is_galbot_7dof else compact_a1_dims(state)).to(dtype=torch.float32)
+                state[:, gripper_slice_indices] *= 0.0
                 state_list.append(state)
 
             if args.visualize_future and generated_video is not None:
@@ -492,28 +500,16 @@ def main() -> None:
             if state_unnorm_fn is not None:
                 state_tensor = state_unnorm_fn({OBS_STATE: state_tensor})[OBS_STATE]
             state_tensor = state_tensor.to(device=device)
-            action_gt_tensor[:, :14] += state_tensor[:, :14]
-            action_pred_tensor[:, :14] += state_tensor[:, :14]
+            action_gt_tensor[:, joint_slice_indices] += state_tensor[:, joint_slice_indices]
+            action_pred_tensor[:, joint_slice_indices] += state_tensor[:, joint_slice_indices]
 
         action_gt_tensor = action_gt_tensor.to(torch.float32)
         action_pred_tensor = action_pred_tensor.to(torch.float32)
 
-        action_gt_gripper = torch.cat(
-            [action_gt_tensor[:, 6:7], action_gt_tensor[:, 13:14]],
-            dim=-1,
-        )
-        action_gt_joint = torch.cat(
-            [action_gt_tensor[:, :6], action_gt_tensor[:, 7:13]],
-            dim=-1,
-        )
-        action_pred_gripper = torch.cat(
-            [action_pred_tensor[:, 6:7], action_pred_tensor[:, 13:14]],
-            dim=-1,
-        )
-        action_pred_joint = torch.cat(
-            [action_pred_tensor[:, :6], action_pred_tensor[:, 7:13]],
-            dim=-1,
-        )
+        action_gt_gripper = action_gt_tensor[:, gripper_slice_indices]
+        action_gt_joint = action_gt_tensor[:, joint_slice_indices]
+        action_pred_gripper = action_pred_tensor[:, gripper_slice_indices]
+        action_pred_joint = action_pred_tensor[:, joint_slice_indices]
 
         metric_mse.append(float(F.mse_loss(action_gt_tensor, action_pred_tensor).cpu()))
         mse_joint.append(float(F.mse_loss(action_gt_joint, action_pred_joint).cpu()))

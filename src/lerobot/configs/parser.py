@@ -212,6 +212,18 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
             return out
 
         if isinstance(data, dict):
+            _dict_leaf_prefixes = {
+                "dataset.image_transforms.tfs",
+                "rename_map",
+                "policy.normalization_mapping",
+                "policy.input_features",
+                "policy.output_features",
+            }
+            if prefix in _dict_leaf_prefixes or prefix.endswith(".kwargs"):
+                import json
+
+                out.append(f"--{prefix}={json.dumps(data)}")
+                return out
             for k, v in data.items():
                 key = f"{prefix}.{k}" if prefix else str(k)
                 out.extend(_yaml_to_cli_args(v, key))

@@ -975,8 +975,8 @@ class InternVLAA15(nn.Module):
         return embs, pad_masks, att_masks
 
     def get_learnable_token_output(self, suffix_out):
-        start = 1  # skip state token
-        end = 1 + self.config.num_learnable_tokens
+        start = 0 if self.config.tokenize_state else 1
+        end = start + self.config.num_learnable_tokens
         return suffix_out[:, start:end]
 
     # ------------------------------------------------------------------
@@ -1295,8 +1295,24 @@ class InternVLAA15(nn.Module):
             context_lens=None,
         )
 
+        def _run_block(blk, hidden, ctx):
+            return blk(
+                hidden,
+                e=e0,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=wan.freqs,
+                context=ctx,
+                context_lens=None,
+            )
+
         for block in wan.blocks:
-            x = block(x, **kwargs)
+            if self.gradient_checkpointing_enabled and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    _run_block, block, x, context, use_reentrant=False
+                )
+            else:
+                x = block(x, **kwargs)
 
         x = wan.head(x, e)
         x = wan.unpatchify(x, grid_sizes)
@@ -1569,6 +1585,43 @@ class InternVLAA15Policy(PreTrainedPolicy):
         )
         return actions, generated_video
 
+    def _reduce_action_loss(
+        self,
+        losses: Tensor,
+        batch: dict[str, Tensor],
+        sample_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute (weighted_action_loss, real_dim_action_loss) with optional pad masking."""
+        zero = torch.tensor(0.0, device=losses.device, dtype=losses.dtype)
+        weights = torch.ones_like(losses)
+        if sample_mask is not None:
+            weights = weights * sample_mask[:, None, None].to(dtype=losses.dtype)
+
+        if self.config.mask_action_pad and "action_is_pad" in batch:
+            action_is_pad = batch["action_is_pad"].to(device=losses.device, dtype=torch.bool)
+            if action_is_pad.ndim == 2 and action_is_pad.shape[1] >= losses.shape[1]:
+                valid_t = ~action_is_pad[:, : losses.shape[1]]
+                weights = weights * valid_t[:, :, None].to(dtype=losses.dtype)
+
+        if "action_dim_mask" in batch:
+            dim_mask = batch["action_dim_mask"].to(device=losses.device, dtype=torch.bool)
+            if dim_mask.ndim == 1:
+                dim_mask = dim_mask.unsqueeze(0).expand(losses.shape[0], -1)
+            dim_mask = dim_mask[:, : losses.shape[-1]]
+            pad_w = float(self.config.padded_action_dim_weight)
+            dim_weights = torch.where(dim_mask, 1.0, pad_w).to(dtype=losses.dtype)
+            weighted_mask = weights * dim_weights[:, None, :]
+            real_mask = weights * dim_mask[:, None, :].to(dtype=losses.dtype)
+        else:
+            weighted_mask = weights
+            real_mask = weights
+
+        w_sum = weighted_mask.sum()
+        loss_fm = (losses * weighted_mask).sum() / w_sum if w_sum > 0 else zero
+        r_sum = real_mask.sum()
+        loss_real = (losses * real_mask).sum() / r_sum if r_sum > 0 else zero
+        return loss_fm, loss_real
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         pixel_values = batch[f"{OBS_PREFIX}pixel_values"]
         image_grid_thw = batch[f"{OBS_PREFIX}image_grid_thw"]
@@ -1643,7 +1696,9 @@ class InternVLAA15Policy(PreTrainedPolicy):
             action_mask = (vqa_type == 0) | (vqa_type == 2)  # robot samples
             vlm_mask = (vqa_type == 1) | (vqa_type == 2)     # samples with VQA labels
 
-            loss_fm_action = losses[action_mask].mean() if action_mask.any() else zero
+            loss_fm_action, loss_action_real = self._reduce_action_loss(
+                losses, batch, sample_mask=action_mask
+            )
             loss_vlm = losses_vlm[vlm_mask].mean() if vlm_mask.any() else zero
 
             loss = (
@@ -1661,17 +1716,21 @@ class InternVLAA15Policy(PreTrainedPolicy):
                 "loss_subtask": loss_subtask.item(),
                 # Action Expert branch
                 "loss_action": loss_fm_action.item(),
+                "loss_action_real": loss_action_real.item(),
                 # Video branch
                 "loss_video": video_loss.item(),
             }
         else:
-            loss_fm_action = losses.mean()
+            loss_fm_action, loss_action_real = self._reduce_action_loss(
+                losses, batch, sample_mask=None
+            )
             loss_vlm = zero
             loss = loss_fm_action + self.config.video_loss_weight * video_loss
             loss_dict = {
                 "loss": loss.item(),
                 # Action Expert branch
                 "loss_action": loss_fm_action.item(),
+                "loss_action_real": loss_action_real.item(),
                 # Video branch
                 "loss_video": video_loss.item(),
             }

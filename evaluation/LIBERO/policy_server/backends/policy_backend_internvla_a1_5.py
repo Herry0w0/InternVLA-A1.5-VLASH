@@ -53,6 +53,8 @@ class InternVLAA15Backend(BasePolicyBackend):
         wan_vae_path: str | None = None,
         action_loss_only: bool = True,
         inference_backend: str = "standard",
+        norm_mode: str = "mean_std",
+        eval_output_tag: str = "<Subtask, Action>",
     ) -> None:
         super().__init__(ckpt_path=ckpt_path, device=device, stats_key=stats_key, robot_type=robot_type)
 
@@ -124,7 +126,9 @@ class InternVLAA15Backend(BasePolicyBackend):
             np.asarray(self.state_stat[OBS_STATE]["mean"], dtype=np.float32).reshape(-1).shape[0]
         )
         self.expected_num_input_images = expected_num_input_images(self.robot_type)
-        self.state_normalizer = NormalizeTransformFn(selected_keys=[OBS_STATE], norm_stats=self.state_stat)
+        self.state_normalizer = NormalizeTransformFn(
+            selected_keys=[OBS_STATE], mode=norm_mode, norm_stats=self.state_stat
+        )
         self.resize = ResizeImagesWithPadFn(height=self.resize_size, width=self.resize_size)
 
         # Resolve action_mode from the schema for the eval robot. Training-time
@@ -145,6 +149,8 @@ class InternVLAA15Backend(BasePolicyBackend):
             max_length=int(max_prompt_length),
             tokenize_state=processor_tokenize_state,
             max_state_dim=config.max_state_dim,
+            norm_mode=norm_mode,
+            eval_output_tag=eval_output_tag,
             use_fast_action_tokens=False,
             mode="eval",
             action_mode=action_mode,

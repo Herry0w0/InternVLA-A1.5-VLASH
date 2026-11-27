@@ -89,8 +89,11 @@ def get_rank_and_world_size() -> tuple[int, int]:
     return 0, 1
 
 def find_info_json_path_for_repo(cfg: TrainPipelineConfig, repo_id: str) -> Path | None:
-    if cfg.dataset.root is not None: 
+    if cfg.dataset.root is not None:
         root = Path(cfg.dataset.root)
+        direct_info = root / "meta" / "info.json"
+        if direct_info.exists():
+            return direct_info
         return root / repo_id / "meta" / "info.json"
     else:
         return HF_LEROBOT_HOME / repo_id / "meta" / "info.json"
@@ -374,16 +377,43 @@ def _build_single_dataset(
     else:
 
         # Create the actual LeRobot dataset (non-streaming recommended for multi-robot)
-        base_ds = LeRobotDataset(
-            repo_id,
-            root=cfg.dataset.root,
-            episodes=cfg.dataset.episodes,
-            delta_timestamps=delta_timestamps,
-            # tolerance_s=0.2, 
-            image_transforms=image_transforms,
-            revision=cfg.dataset.revision,
-            video_backend=cfg.dataset.video_backend,
+        use_vlash = getattr(cfg.dataset, "vlash_enabled", False) or getattr(
+            cfg.dataset, "enable_head_history", False
         )
+        if use_vlash:
+            from lerobot.datasets.vlash_dataset import VLASHLeRobotDataset
+
+            base_ds = VLASHLeRobotDataset(
+                repo_id,
+                root=cfg.dataset.root,
+                episodes=cfg.dataset.episodes,
+                delta_timestamps=delta_timestamps,
+                image_transforms=image_transforms,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+                vlash_enabled=getattr(cfg.dataset, "vlash_enabled", False),
+                vlash_min_delay_steps=getattr(cfg.dataset, "vlash_min_delay_steps", 1),
+                vlash_max_delay_steps=getattr(cfg.dataset, "vlash_max_delay_steps", 12),
+                vlash_zero_delay_prob=getattr(cfg.dataset, "vlash_zero_delay_prob", 0.1),
+                wan_video_span_steps=getattr(cfg.dataset, "wan_video_span_steps", None),
+                enable_head_history=getattr(cfg.dataset, "enable_head_history", False),
+                head_history_gap=getattr(cfg.dataset, "head_history_gap", 4),
+                head_camera_key=getattr(cfg.dataset, "head_camera_key", "observation.images.head_right"),
+                chunk_size=getattr(cfg.policy, "chunk_size", 30),
+                num_video_frames=getattr(cfg.policy, "num_video_frames", 4),
+                letterbox_pad_px=getattr(cfg.dataset, "letterbox_pad_px", -1),
+            )
+        else:
+            base_ds = LeRobotDataset(
+                repo_id,
+                root=cfg.dataset.root,
+                episodes=cfg.dataset.episodes,
+                delta_timestamps=delta_timestamps,
+                # tolerance_s=0.2, 
+                image_transforms=image_transforms,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+            )
         transformed_ds = TransformedLeRobotDataset.from_base(
             base_ds,
             cfg.dataset.data_transforms.inputs,

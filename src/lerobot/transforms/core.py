@@ -97,7 +97,12 @@ class PadStateAndActionTransformFn(DataTransformFn):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    def __call__(self, data: DataDict) -> DataDict: 
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_action_dim = data[ACTION].shape[-1]
+        valid_dims = min(raw_action_dim, self.max_action_dim)
+        dim_mask = torch.zeros(self.max_action_dim, dtype=torch.bool)
+        dim_mask[:valid_dims] = True
+        data["action_dim_mask"] = dim_mask
         data[OBS_STATE] = self._pad_vector(data[OBS_STATE], self.max_state_dim)
         data[ACTION] = self._pad_vector(data[ACTION], self.max_action_dim)
         return data
@@ -142,6 +147,9 @@ class ResizeImagesWithPadFn(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         for img_key in self.mapping.keys():
             data[img_key] = resize_with_pad(data[img_key], self.height, self.width, self.mode)
+        for prev_key in list(data.keys()):
+            if prev_key.startswith(f"{OBS_IMAGES}.") and prev_key.endswith("_prev"):
+                data[prev_key] = resize_with_pad(data[prev_key], self.height, self.width, self.mode)
         return data
 
 
@@ -237,6 +245,14 @@ class RemapImageKeyTransformFn(DataTransformFn):
         for old_key, new_key in self.mapping.items():
             data[new_key] = data.pop(old_key)
             data[f"{new_key}_mask"] = torch.tensor(True)
+        prev_keys = [
+            k for k in list(data.keys())
+            if k.startswith(f"{OBS_IMAGES}.") and k.endswith("_prev")
+        ]
+        if prev_keys:
+            idx3 = f"{OBS_IMAGES}.image3"
+            data[idx3] = data.pop(prev_keys[0])
+            data[f"{idx3}_mask"] = torch.tensor(True)
         # create missing keys if necessary
         if len(self.mapping) < 3:
             data[f"{OBS_IMAGES}.image2"] = torch.ones_like(data[f"{OBS_IMAGES}.image0"])
@@ -495,6 +511,10 @@ class ReorderStateActionTransform(DataTransformFn):
         # Reorder action if specified
         if self.action_reorder is not None:
             data[ACTION] = self._reorder(data[ACTION], self.action_reorder)
+            if "action_dim_mask" in data:
+                data["action_dim_mask"] = self._reorder(
+                    data["action_dim_mask"].to(torch.uint8), self.action_reorder
+                ).bool()
         
         # Reorder state if specified
         if self.state_reorder is not None:

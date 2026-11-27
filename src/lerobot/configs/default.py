@@ -45,6 +45,16 @@ class DatasetConfig(draccus.ChoiceRegistry, abc.ABC):
     dist_loading: bool = False
     buffer_size: int = 1024
     action_mode: str = "abs"  # abs | delta
+    vlash_enabled: bool = False
+    vlash_min_delay_steps: int = 1
+    vlash_max_delay_steps: int = 12
+    vlash_zero_delay_prob: float = 0.1
+    vlash_condition_on_delay: bool = True
+    wan_video_span_steps: int | None = None
+    enable_head_history: bool = False
+    head_history_gap: int = 4
+    head_camera_key: str = "observation.images.head_right"
+    letterbox_pad_px: int = -1  # -1 = auto-detect per-camera black letterbox border; 0 = disabled; >0 = fixed top/bottom px
     repack_transforms: TransformGroup = field(default_factory=TransformGroup)
     data_transforms: TransformGroup = field(default_factory=TransformGroup)
     model_transforms: TransformGroup = field(default_factory=TransformGroup)
@@ -71,6 +81,8 @@ class VQADatasetConfig(draccus.ChoiceRegistry, abc.ABC):
 @dataclass
 class WandBConfig:
     enable: bool = False
+    # Logging backend: 'wandb' or 'swanlab'
+    backend: str = "wandb"
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
     disable_artifact: bool = False
     project: str = "lerobot"

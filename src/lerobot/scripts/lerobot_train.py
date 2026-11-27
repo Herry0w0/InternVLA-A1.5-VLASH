@@ -118,6 +118,8 @@ def update_policy(
     train_metrics.loss = loss.item()
     if "loss_action" in output_dict:
         train_metrics.loss_action = output_dict["loss_action"]
+    if "loss_action_real" in output_dict and hasattr(train_metrics, "loss_action_real"):
+        train_metrics.loss_action_real = output_dict["loss_action_real"]
     if "loss_video" in output_dict:
         train_metrics.loss_video = output_dict["loss_video"]
     if "loss_vqa" in output_dict:
@@ -126,6 +128,11 @@ def update_policy(
         train_metrics.loss_fast = output_dict["loss_fast"]
     if "loss_subtask" in output_dict:
         train_metrics.loss_subtask = output_dict["loss_subtask"]
+    if "vlash_delay_steps" in batch:
+        vlash_delay_val = float(batch["vlash_delay_steps"].float().mean().item())
+        output_dict["vlash_mean_delay"] = vlash_delay_val
+        if hasattr(train_metrics, "vlash_delay"):
+            train_metrics.vlash_delay = vlash_delay_val
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
@@ -288,6 +295,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics = {
             "loss": AverageMeter("loss", ":.3f"),
             "loss_action": AverageMeter("loss_action", ":.3f"),
+            "loss_action_real": AverageMeter("loss_act_r", ":.3f"),
             "grad_norm": AverageMeter("grdn", ":.3f"),
             "lr": AverageMeter("lr", ":0.1e"),
             "update_s": AverageMeter("updt_s", ":.3f"),
@@ -312,6 +320,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.type == "internvla_a1_5":
         train_metrics["loss_fast"] = AverageMeter("loss_fast", ":.3f")
         train_metrics["loss_subtask"] = AverageMeter("loss_subtask", ":.3f")
+
+    if getattr(cfg.dataset, "vlash_enabled", False):
+        train_metrics["vlash_delay"] = AverageMeter("vlash_d", ":.2f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training

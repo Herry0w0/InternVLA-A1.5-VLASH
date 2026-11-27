@@ -32,6 +32,11 @@ class InternVLAA15DatasetConfig(DatasetConfig):
     num_video_frames: int = 4
     video_height: int = 224
     video_width: int = 224
+    vlm_model_name_or_path: str = "Qwen/Qwen3.5-2B"
+    fast_tokenizer_path: str = "physical-intelligence/fast"
+    norm_mode: str = "mean_std"
+    state_dropout_prob: float = 0.0
+    eval_output_tag: str = "<Subtask, Action>"
 
     data_transforms: TransformGroup = field(
         default_factory=lambda: TransformGroup(
@@ -45,9 +50,7 @@ class InternVLAA15DatasetConfig(DatasetConfig):
                 ExtractVideoFramesTransformFn(),
                 NormalizeTransformFn(),
                 ComposeFieldsTransform(),
-                FASTInternVLAA15ActionTokenizerTransformFn(),
                 LoadActionTextFromJsonlTransformFn(),
-                InternVLAA15ChatProcessorTransformFn(),
                 PadStateAndActionTransformFn(
                     max_state_dim=InternVLAA15DatasetConfig.max_state_dim,
                     max_action_dim=InternVLAA15DatasetConfig.max_action_dim,
@@ -74,30 +77,74 @@ class InternVLAA15DatasetConfig(DatasetConfig):
             logging.info("action_mode='abs' -> Removing DeltaActionTransformFn")
             inputs = [t for t in inputs if not isinstance(t, DeltaActionTransformFn)]
 
+        inputs = [
+            t
+            for t in inputs
+            if not isinstance(
+                t, (FASTInternVLAA15ActionTokenizerTransformFn, InternVLAA15ChatProcessorTransformFn)
+            )
+        ]
+
+        if self.use_fast_action_tokens:
+            fast_idx = next(
+                (i for i, t in enumerate(inputs) if isinstance(t, LoadActionTextFromJsonlTransformFn)),
+                next(
+                    (i for i, t in enumerate(inputs) if isinstance(t, PadStateAndActionTransformFn)),
+                    len(inputs),
+                ),
+            )
+            inputs.insert(
+                fast_idx,
+                FASTInternVLAA15ActionTokenizerTransformFn(
+                    action_tokenizer_name=self.fast_tokenizer_path,
+                    qwen35_model_name=self.vlm_model_name_or_path,
+                    chunk_size=self.chunk_size,
+                    max_action_dim=self.max_action_dim,
+                ),
+            )
+
+        num_views = 4 if self.enable_head_history else 3
         processor = InternVLAA15ChatProcessorTransformFn(
+            pretrained_model_name_or_path=self.vlm_model_name_or_path,
             tokenize_state=self.tokenize_state,
             max_state_dim=self.max_state_dim,
             max_length=self.max_prompt_length,
+            num_views=num_views,
             use_fast_action_tokens=self.use_fast_action_tokens,
             mode=self.mode,
+            norm_mode=self.norm_mode,
+            state_dropout_prob=self.state_dropout_prob,
+            vlash_condition_on_delay=(self.vlash_enabled and self.vlash_condition_on_delay),
+            eval_output_tag=self.eval_output_tag,
         )
-        inputs = [t for t in inputs if not isinstance(t, InternVLAA15ChatProcessorTransformFn)]
         insert_idx = next(
             (i for i, t in enumerate(inputs) if isinstance(t, PadStateAndActionTransformFn)),
             len(inputs),
         )
         inputs.insert(insert_idx, processor)
 
-        has_fast = any(isinstance(t, FASTInternVLAA15ActionTokenizerTransformFn) for t in inputs)
-        if self.use_fast_action_tokens and not has_fast:
-            inputs.insert(insert_idx, FASTInternVLAA15ActionTokenizerTransformFn())
-        elif not self.use_fast_action_tokens and has_fast:
-            inputs = [t for t in inputs if not isinstance(t, FASTInternVLAA15ActionTokenizerTransformFn)]
-
-        for t in inputs:
-            if isinstance(t, FASTInternVLAA15ActionTokenizerTransformFn):
-                t.chunk_size = self.chunk_size
-                break
+        for idx_t, t in enumerate(inputs):
+            if isinstance(t, NormalizeTransformFn):
+                inputs[idx_t] = replace(t, mode=self.norm_mode)
+            elif isinstance(t, ExtractVideoFramesTransformFn):
+                inputs[idx_t] = replace(
+                    t, video_height=self.video_height, video_width=self.video_width
+                )
+            elif isinstance(t, ResizeImagesWithPadFn):
+                inputs[idx_t] = replace(t, height=self.height, width=self.width)
+            elif isinstance(t, PadStateAndActionTransformFn):
+                inputs[idx_t] = replace(
+                    t, max_state_dim=self.max_state_dim, max_action_dim=self.max_action_dim
+                )
+            elif isinstance(t, UnifyInternVLAA15InputsTransformFn):
+                inputs[idx_t] = replace(
+                    t,
+                    num_video_frames=self.num_video_frames,
+                    video_height=self.video_height,
+                    video_width=self.video_width,
+                    chunk_size=self.chunk_size,
+                    max_action_dim=self.max_action_dim,
+                )
 
         self.data_transforms = replace(self.data_transforms, inputs=inputs)
 
@@ -114,6 +161,8 @@ class UnifyInternVLAA15InputsTransformFn(DataTransformFn):
     num_video_frames: int = 4
     video_height: int = 224
     video_width: int = 224
+    chunk_size: int = 50
+    max_action_dim: int = 32
 
     def __call__(self, data: DataDict) -> DataDict:
         from lerobot.utils.constants import OBS_STATE, ACTION, OBS_STR
@@ -135,9 +184,21 @@ class UnifyInternVLAA15InputsTransformFn(DataTransformFn):
                 self.num_video_frames + 1, 3, self.video_height, self.video_width
             )
 
+        action_tensor = data[ACTION]
+        action_is_pad = data.get(
+            "action_is_pad",
+            torch.zeros(action_tensor.shape[0] if action_tensor.ndim >= 2 else self.chunk_size, dtype=torch.bool),
+        )
+        action_dim_mask = data.get(
+            "action_dim_mask",
+            torch.ones(action_tensor.shape[-1], dtype=torch.bool),
+        )
+
         return {
             OBS_STATE: data[OBS_STATE],
-            ACTION: data[ACTION],
+            ACTION: action_tensor,
+            "action_is_pad": action_is_pad.to(dtype=torch.bool),
+            "action_dim_mask": action_dim_mask.to(dtype=torch.bool),
             f"{OBS_STR}.pixel_values": data[f"{OBS_STR}.pixel_values"],
             f"{OBS_STR}.image_grid_thw": data[f"{OBS_STR}.image_grid_thw"],
             f"{OBS_STR}.input_ids": input_ids,
@@ -147,6 +208,7 @@ class UnifyInternVLAA15InputsTransformFn(DataTransformFn):
             "VQA.labels": data["VQA.labels"],
             "label_mode": label_mode,
             video_key: video_frames,
+            "vlash_delay_steps": data.get("vlash_delay_steps", torch.tensor(0, dtype=torch.long)),
         }
 
 
@@ -162,6 +224,8 @@ class UnifyInternVLAA15VQAInputsTransformFn(DataTransformFn):
     num_video_frames: int = 4
     video_height: int = 224
     video_width: int = 224
+    chunk_size: int = 50
+    max_action_dim: int = 32
 
     def __call__(self, data: DataDict) -> DataDict:
         from lerobot.utils.constants import OBS_STATE, ACTION, OBS_STR
@@ -178,10 +242,18 @@ class UnifyInternVLAA15VQAInputsTransformFn(DataTransformFn):
         video_frames = torch.zeros(
             self.num_video_frames + 1, 3, self.video_height, self.video_width
         )
+        action_tensor = data[ACTION]
+        action_is_pad = torch.zeros(
+            action_tensor.shape[0] if action_tensor.ndim >= 2 else self.chunk_size,
+            dtype=torch.bool,
+        )
+        action_dim_mask = torch.ones(action_tensor.shape[-1], dtype=torch.bool)
 
         return {
             OBS_STATE: data[OBS_STATE],
-            ACTION: data[ACTION],
+            ACTION: action_tensor,
+            "action_is_pad": action_is_pad,
+            "action_dim_mask": action_dim_mask,
             f"{OBS_STR}.pixel_values": data[f"{OBS_STR}.pixel_values"],
             f"{OBS_STR}.image_grid_thw": data[f"{OBS_STR}.image_grid_thw"],
             f"{OBS_STR}.input_ids": input_ids,
@@ -191,6 +263,7 @@ class UnifyInternVLAA15VQAInputsTransformFn(DataTransformFn):
             "VQA.labels": data["VQA.labels"],
             "label_mode": label_mode,
             "observation.video_frames": video_frames,
+            "vlash_delay_steps": torch.tensor(0, dtype=torch.long),
         }
 
 
@@ -316,6 +389,10 @@ class InternVLAA15Config(PreTrainedConfig):
     # FAST action tokens
     action_token_min: int = 248077
     action_token_max: int = 250124
+
+    # Action loss masking (VLASH / episode-tail padding & padded action dims)
+    mask_action_pad: bool = False
+    padded_action_dim_weight: float = 1.0
 
     # Knowledge insulation
     knowledge_insulation: bool = False

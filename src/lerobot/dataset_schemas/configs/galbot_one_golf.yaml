@@ -1,0 +1,16 @@
+# Galbot One G1 dual-arm 7-DOF + gripper (16-dim)
+# Dimension layout matches InternVLA-A1.5 pretraining convention (left arm first):
+#   left_arm(7) [0:7] + left_gripper(1) [7:8] + right_arm(7) [8:15] + right_gripper(1) [15:16]
+robot_type: galbot_one_golf
+action_mask_spec: [7, -1, 7, -1]
+feature_mapping:
+  observation.state:
+    - observation.state
+  action:
+    - action
+image_mapping:
+  observation.images.head_right: observation.images.image0
+  observation.images.left_arm: observation.images.image1
+  observation.images.right_arm: observation.images.image2
+action_mode: joint
+description: "Galbot One G1 dual-arm 7-DOF + gripper (16-dim, left-first aligned with A1.5 pretrain) for parcel flip"

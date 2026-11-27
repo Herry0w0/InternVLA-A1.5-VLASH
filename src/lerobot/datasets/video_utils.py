@@ -35,7 +35,16 @@ from PIL import Image
 
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
+        try:
+            from torchcodec.decoders import VideoDecoder  # noqa: F401
+
+            return "torchcodec"
+        except Exception as exc:
+            logging.warning(
+                "'torchcodec' failed to load (%s), falling back to 'pyav' as a default decoder",
+                exc,
+            )
+            return "pyav"
     else:
         logging.warning(
             "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
@@ -101,42 +110,66 @@ def decode_video_frames_torchvision(
     """
     video_path = str(video_path)
 
-    # set backend
-    keyframes_only = False
-    torchvision.set_video_backend(backend)
-    if backend == "pyav":
-        keyframes_only = True  # pyav doesn't support accurate seek
-
-    # set a video stream reader
-    # TODO(rcadene): also load audio stream at the same time
-    reader = torchvision.io.VideoReader(video_path, "video")
-
     # set the first and last requested timestamps
-    # Note: previous timestamps are usually loaded, since we need to access the previous key frame
     first_ts = min(timestamps)
     last_ts = max(timestamps)
-
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
-
-    # load all frames until last requested frame
     loaded_frames = []
     loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
 
-    if backend == "pyav":
-        reader.container.close()
+    if backend == "pyav" and not hasattr(torchvision.io, "VideoReader"):
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            if first_ts > 0 and stream.time_base is not None:
+                seek_pts = int(max(0.0, first_ts - tolerance_s) / float(stream.time_base)) + (
+                    stream.start_time or 0
+                )
+                container.seek(seek_pts, any_frame=False, backward=True, stream=stream)
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                current_ts = (
+                    float(frame.time)
+                    if frame.time is not None
+                    else float(frame.pts * stream.time_base)
+                )
+                if log_loaded_timestamps:
+                    logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+                loaded_frames.append(
+                    torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
+                )
+                loaded_ts.append(current_ts)
+                if current_ts >= last_ts:
+                    break
+    else:
+        # set backend
+        keyframes_only = False
+        torchvision.set_video_backend(backend)
+        if backend == "pyav":
+            keyframes_only = True  # pyav doesn't support accurate seek
 
-    reader = None
+        # set a video stream reader
+        # TODO(rcadene): also load audio stream at the same time
+        reader = torchvision.io.VideoReader(video_path, "video")
+
+        # access closest key frame of the first requested frame
+        # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
+        # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
+        reader.seek(first_ts, keyframes_only=keyframes_only)
+
+        # load all frames until last requested frame
+        for frame in reader:
+            current_ts = frame["pts"]
+            if log_loaded_timestamps:
+                logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+            loaded_frames.append(frame["data"])
+            loaded_ts.append(current_ts)
+            if current_ts >= last_ts:
+                break
+
+        if backend == "pyav":
+            reader.container.close()
+
+        reader = None
 
     query_ts = torch.tensor(timestamps)
     loaded_ts = torch.tensor(loaded_ts)
