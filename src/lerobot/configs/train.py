@@ -52,6 +52,7 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    gradient_accumulation_steps: int = 1
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
@@ -117,6 +118,11 @@ class TrainPipelineConfig(HubMixin):
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = self.policy.get_optimizer_preset()
             self.scheduler = self.policy.get_scheduler_preset()
+
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+            )
 
         if self.policy.push_to_hub and not self.policy.repo_id:
             raise ValueError(

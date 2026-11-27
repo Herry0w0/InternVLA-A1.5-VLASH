@@ -37,6 +37,7 @@ def test_yaml_and_launch_security_and_defaults():
     assert ds["norm_mode"] == "mean_std", "Must match InternVLA-A1.5 pretraining normalization"
     assert ds["vlash_enabled"] is True
     assert ds["vlash_condition_on_delay"] is True
+    assert ds["vlash_use_state_ground_truth"] is False
     assert ds["wan_video_span_steps"] == 42
     assert ds["letterbox_pad_px"] == 28
     assert ds["eval_output_tag"] == "<Action>"
@@ -229,6 +230,173 @@ def test_vlash_async_controller_roll_forward_and_handover():
     assert vals == [4.0, 5.0, 6.0, 100.0]
 
 
+    # 5. Action quantization scaling (q=2) and explicit n_action_steps
+    ctrl_q = VLASHFutureStateController(
+        fps=30.0,
+        chunk_size=30,
+        fixed_delay_steps=3,
+        action_quant_ratio=2,
+    )
+    assert ctrl_q.effective_chunk_ticks == 15
+    plan_q0 = ctrl_q.plan_future_state(sensor0)
+    chunk_q0 = np.stack([np.full(16, float(i), dtype=np.float32) for i in range(30)], axis=0)
+    ctrl_q.commit_predicted_chunk(chunk_q0, plan_q0)
+    assert ctrl_q.queue_length == 15
+    # Must NOT trigger immediately when full quantized chunk (15 ticks) is loaded
+    assert ctrl_q.should_trigger_inference() is False
+    # Plan at tick 0 with delay_ticks=3, q=2 -> model delay_steps must be 3 * 2 = 6
+    plan_q1 = ctrl_q.plan_future_state(sensor0)
+    assert plan_q1.delay_ticks == 3
+    assert plan_q1.delay_steps == 6
+    assert plan_q1.handover_step == 3
+
+    # Explicit n_action_steps=16, fixed_delay_steps=4, q=1 -> triggers when remaining == 30 - (16 - 4) = 18
+    ctrl_h = VLASHFutureStateController(
+        fps=30.0,
+        chunk_size=30,
+        n_action_steps=16,
+        fixed_delay_steps=4,
+        action_quant_ratio=1,
+    )
+    p0 = ctrl_h.plan_future_state(sensor0)
+    ctrl_h.commit_predicted_chunk(chunk_q0, p0)
+    for step_idx in range(12):
+        assert ctrl_h.should_trigger_inference() is False, f"Should not trigger at step {step_idx}"
+        ctrl_h.pop_action()
+    # At step 12 (remaining=18), should trigger so handover lands cleanly at step 12 + 4 = 16
+    assert ctrl_h.should_trigger_inference() is True
+    p1 = ctrl_h.plan_future_state(sensor0)
+    assert p1.trigger_step == 12
+    assert p1.handover_step == 16
+    assert float(p1.future_state[0]) == 15.0  # a_{12 + 4 - 1} = a_{15}
+
+
+def test_vlash_async_zero_off_by_one_snapshot_and_concurrency():
+    import threading
+    import time
+    from tools.parcel_flip.vlash_async_policy import VLASHAsyncInternVLAPolicy
+
+    calls: list[dict] = []
+    active_infer = 0
+    max_concurrent = 0
+    infer_counter_lock = threading.Lock()
+    slow_second_call = threading.Event()
+
+    class DummyPolicy:
+        def predict_action_chunk(self, inputs):
+            nonlocal active_infer, max_concurrent
+            with infer_counter_lock:
+                active_infer += 1
+                max_concurrent = max(max_concurrent, active_infer)
+                call_idx = len(calls) - 1
+            try:
+                if call_idx in (1, 2):
+                    # Simulate slow background inference
+                    slow_second_call.wait(timeout=0.5)
+                    time.sleep(0.03)
+                # Encode call_idx * 100 + k into action values
+                vals = torch.arange(10, dtype=torch.float32)[:, None].expand(10, 16) + float(call_idx * 100)
+                return vals.unsqueeze(0)
+            finally:
+                with infer_counter_lock:
+                    active_infer -= 1
+
+    class DummyNorm:
+        def __call__(self, sample):
+            return sample
+
+    class DummyProc:
+        def __call__(self, sample):
+            calls.append(
+                {
+                    "delay": int(sample["vlash_delay_steps"].item()),
+                    "future_state0": float(sample["observation.state"][0].item()),
+                    "head_mean": float(sample["observation.images.image0"].mean().item()),
+                }
+            )
+            return {
+                "observation.input_ids": torch.ones(8, dtype=torch.long),
+                "observation.attention_mask": torch.ones(8, dtype=torch.bool),
+                "observation.state": sample["observation.state"],
+            }
+
+    wrapper = VLASHAsyncInternVLAPolicy(
+        policy=DummyPolicy(),
+        processor=DummyProc(),
+        state_normalizer=DummyNorm(),
+        action_stats={"mean": np.zeros(16, dtype=np.float32), "std": np.ones(16, dtype=np.float32)},
+        norm_mode="mean_std",
+        action_mode="abs",
+        action_mask=np.array([True] * 7 + [False] + [True] * 7 + [False]),
+        chunk_size=10,
+        action_dim=16,
+        n_action_steps=8,
+        min_delay_steps=1,
+        max_delay_steps=6,
+        fixed_delay_steps=3,
+        servo_lag_steps=0,
+        action_quant_ratio=1,
+        device="cpu",
+        dtype=torch.float32,
+        fps=30.0,
+    )
+    init_ema = wrapper.controller.ema_infer_s
+
+    # Tick 0 (cold start): delay=0, returns chunk0[0]=0.0, does NOT pollute ema_infer_s
+    img_buf = np.zeros((224, 224, 3), dtype=np.uint8)
+    images = {"head_right": img_buf, "left_arm": img_buf, "right_arm": img_buf}
+    sensor = np.full(16, -5.0, dtype=np.float32)
+    a0 = wrapper.step_action(images, sensor)
+    assert float(a0[0]) == 0.0
+    assert calls[0]["delay"] == 0
+    assert calls[0]["future_state0"] == -5.0
+    assert wrapper.controller.ema_infer_s == init_ema  # un-warmed cold start did not corrupt EMA
+
+    # Ticks 1..4: consume chunk0[1..4]; n_action_steps=8, delay=3 -> trigger at tick 8 - 3 = 5!
+    for t in range(1, 5):
+        at = wrapper.step_action(images, sensor)
+        assert np.isclose(float(at[0]), float(t), atol=1e-3)
+    assert len(calls) == 1  # Not triggered yet
+
+    # Tick 5: set distinctive image value (0.5 -> ~128), call step_action, then IMMEDIATELY overwrite buffer!
+    img_buf[:] = 128
+    a5 = wrapper.step_action(images, sensor)
+    img_buf[:] = 255  # Mutate caller buffer immediately after return!
+    assert np.isclose(float(a5[0]), 5.0, atol=1e-3)  # Still executes chunk0[5]
+
+    # Release slow worker and verify ticks 6, 7 execute chunk0[6..7], tick 8 hands over to chunk1[0]=100.0
+    slow_second_call.set()
+    if wrapper._worker_thread is not None:
+        wrapper._worker_thread.join(timeout=2.0)
+
+    assert len(calls) == 2
+    assert calls[1]["delay"] == 3
+    # Zero off-by-one: triggered at tick 5 with delay 3 -> future_state must be a_{5+3-1} = a_7 = 7.0!
+    assert np.isclose(calls[1]["future_state0"], 7.0, atol=1e-3)
+    # Snapshot isolation: worker must see ~128/255 (~0.502), NOT overwritten 255/255 (1.0)!
+    assert abs(calls[1]["head_mean"] - (128.0 / 255.0)) < 0.02
+
+    a6 = wrapper.step_action(images, sensor)
+    a7 = wrapper.step_action(images, sensor)
+    a8 = wrapper.step_action(images, sensor)
+    assert np.allclose([float(a6[0]), float(a7[0]), float(a8[0])], [6.0, 7.0, 100.0], atol=1e-3)
+
+    # Overrun concurrency test: keep call 2 blocked past the entire remaining queue so step_action
+    # empties the queue while background worker is still alive -> must join cleanly (max_concurrent == 1)
+    slow_second_call.clear()
+    # Consume ticks 9..17 (remaining 9 actions of chunk1); trigger fires at tick 13, worker blocks until delayed release
+    def _delayed_release():
+        time.sleep(0.08)
+        slow_second_call.set()
+
+    releaser = threading.Thread(target=_delayed_release, daemon=True)
+    releaser.start()
+    overrun_vals = [float(wrapper.step_action(images, sensor)[0]) for _ in range(10)]
+    releaser.join(timeout=1.0)
+    assert overrun_vals[-1] >= 199.9  # Switched cleanly to chunk2 after joining slow worker
+    assert max_concurrent == 1  # Strictly serialized inference, zero CUDA Graph race
+
+
 def test_action_loss_masking_logic():
     # Standalone verification of InternVLAA15Policy._reduce_action_loss math
     from lerobot.policies.internvla_a1_5.modeling_internvla_a1_5 import InternVLAA15Policy
@@ -318,7 +486,8 @@ if pytest is not None:
 
         ep0_end = int(ds.meta.episodes[0]["dataset_to_index"])
         t_exec = min(ep0_end - 1, 10 + delay)
-        expected_state = ds.hf_dataset[t_exec]["observation.state"]
+        # Official VLASH default (vlash_use_state_ground_truth=False): delta>0 uses a_{t+delta-1}
+        expected_state = ds.hf_dataset[t_exec - 1]["action"]
         expected_action0 = ds.hf_dataset[t_exec]["action"]
 
         assert torch.allclose(sample["observation.state"], expected_state, atol=1e-6)
@@ -327,6 +496,48 @@ if pytest is not None:
         assert torch.allclose(sample["action"][0], expected_action0, atol=1e-6)
         assert sample["observation.video_frames_raw"].shape == (5, 3, 224, 224)
         assert "observation.images.head_right_prev" not in sample
+
+        # Verify delta == 0 still uses recorded sensor s_t (for synchronous cold start)
+        ds_zero = VLASHLeRobotDataset(
+            repo_id="local/dynamic_parcel_flip",
+            root=DATASET_ROOT,
+            vlash_enabled=True,
+            vlash_min_delay_steps=1,
+            vlash_max_delay_steps=12,
+            vlash_zero_delay_prob=1.0,
+            vlash_use_state_ground_truth=False,
+            wan_video_span_steps=42,
+            enable_head_history=False,
+            chunk_size=30,
+            num_video_frames=4,
+            letterbox_pad_px=28,
+        )
+        sample_zero = ds_zero[10]
+        assert int(sample_zero["vlash_delay_steps"].item()) == 0
+        assert torch.allclose(
+            sample_zero["observation.state"], ds_zero.hf_dataset[10]["observation.state"], atol=1e-6
+        )
+
+        # Verify optional vlash_use_state_ground_truth=True fallback still works
+        ds_gt = VLASHLeRobotDataset(
+            repo_id="local/dynamic_parcel_flip",
+            root=DATASET_ROOT,
+            vlash_enabled=True,
+            vlash_min_delay_steps=1,
+            vlash_max_delay_steps=12,
+            vlash_zero_delay_prob=0.0,
+            vlash_use_state_ground_truth=True,
+            wan_video_span_steps=42,
+            enable_head_history=False,
+            chunk_size=30,
+            num_video_frames=4,
+            letterbox_pad_px=28,
+        )
+        sample_gt = ds_gt[10]
+        t_exec_gt = min(ep0_end - 1, 10 + int(sample_gt["vlash_delay_steps"].item()))
+        assert torch.allclose(
+            sample_gt["observation.state"], ds_gt.hf_dataset[t_exec_gt]["observation.state"], atol=1e-6
+        )
 
     @pytest.mark.skipif(not (DATASET_ROOT / "meta/info.json").exists(), reason="Converted dataset not present")
     def test_internvla_transforms_delay_prompt_and_conditional_state_dropout(monkeypatch):
@@ -396,6 +607,49 @@ if pytest is not None:
         assert "State:" in decoded
         assert " -1 " not in decoded
 
+    def test_eval_pad_length_keeps_constant_prefix_len(monkeypatch):
+        from lerobot.policies.internvla_a1_5.transform_internvla_a1_5 import (
+            InternVLAA15ChatProcessorTransformFn,
+        )
+
+        vlm_path = Path("/mnt/data3/Qwen3.5-2B")
+        if not vlm_path.exists():
+            pytest.skip("Offline VLM weights not present")
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
+        proc = InternVLAA15ChatProcessorTransformFn(
+            pretrained_model_name_or_path=str(vlm_path),
+            max_length=650,
+            num_views=3,
+            tokenize_state=True,
+            max_state_dim=32,
+            norm_mode="mean_std",
+            vlash_condition_on_delay=True,
+            eval_output_tag="<Action>",
+            eval_pad_length=416,
+            use_fast_action_tokens=False,
+            mode="eval",
+            action_mode="joint",
+        )
+        seen_lens = set()
+        for val, delay in [(-3.0, 0), (-1.2, 3), (0.0, 9), (2.9, 12)]:
+            sample = {
+                "observation.images.image0": torch.zeros(3, 224, 224),
+                "observation.images.image0_mask": True,
+                "observation.images.image1": torch.zeros(3, 224, 224),
+                "observation.images.image1_mask": True,
+                "observation.images.image2": torch.zeros(3, 224, 224),
+                "observation.images.image2_mask": True,
+                "observation.state": torch.full((16,), val),
+                "task": "Flip the parcel so the label faces up",
+                "vlash_delay_steps": torch.tensor(delay, dtype=torch.long),
+            }
+            out = proc(sample)
+            seen_lens.add(int(out["observation.input_ids"].shape[0]))
+            assert int(out["observation.attention_mask"][-1].item()) == 0
+        assert seen_lens == {416}
+
 
 if __name__ == "__main__":
     test_yaml_and_launch_security_and_defaults()
@@ -403,4 +657,5 @@ if __name__ == "__main__":
     test_detect_letterbox_borders_multi_aspect_ratios()
     test_wan_sdpa_fallback_fp32_dtype_and_window_mask()
     test_vlash_async_controller_roll_forward_and_handover()
+    test_vlash_async_zero_off_by_one_snapshot_and_concurrency()
     print("Standalone pure-Python unit tests PASSED!")

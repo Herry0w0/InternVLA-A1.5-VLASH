@@ -67,7 +67,13 @@ class VLASHLeRobotDataset(LeRobotDataset):
             ``right_arm`` at ``t``.
           * Optional head history (``enable_head_history=True``): also loads ``t - head_history_gap``
             stored under ``f"{head_camera_key}_prev"``.
-      - Proprioceptive ``observation.state`` is read at ``t + delta`` (``idx_exec``).
+      - Proprioceptive ``observation.state``:
+          * When ``delta == 0``: recorded sensor ``s_t`` (matches synchronous cold start).
+          * When ``delta > 0``:
+              - If ``vlash_use_state_ground_truth=False`` (official VLASH default, requires
+                ``state_dim == action_dim``): previous commanded target ``a_{t + delta - 1}``
+                as proxy future state, eliminating servo tracking-lag mismatch at inference.
+              - If ``vlash_use_state_ground_truth=True``: recorded future sensor ``s_{t + delta}``.
       - Target ``action`` chunk ``[t + delta, ..., t + delta + chunk_size - 1]`` and
         ``action_is_pad`` are read starting at ``idx_exec``.
       - Clean (un-augmented) WAN2.2 future video frames are sampled uniformly across a **fixed**
@@ -94,6 +100,7 @@ class VLASHLeRobotDataset(LeRobotDataset):
         vlash_min_delay_steps: int = 1,
         vlash_max_delay_steps: int = 12,
         vlash_zero_delay_prob: float = 0.1,
+        vlash_use_state_ground_truth: bool = False,
         wan_video_span_steps: int | None = None,
         enable_head_history: bool = False,
         head_history_gap: int = 4,
@@ -123,6 +130,7 @@ class VLASHLeRobotDataset(LeRobotDataset):
             else 0
         )
         self.vlash_zero_delay_prob = float(vlash_zero_delay_prob)
+        self.vlash_use_state_ground_truth = bool(vlash_use_state_ground_truth)
         self.enable_head_history = bool(enable_head_history)
         self.head_history_gap = int(head_history_gap)
         self.head_camera_key = str(head_camera_key)
@@ -243,11 +251,34 @@ class VLASHLeRobotDataset(LeRobotDataset):
         effective_delay = abs_exec - abs_obs
         abs_prev = max(ep_start, abs_obs - self.head_history_gap)
 
-        # State at t + delta (idx_exec)
-        rel_exec = self._to_relative_index(abs_exec)
-        exec_row = self.hf_dataset[rel_exec]
-        if "observation.state" in exec_row:
-            item["observation.state"] = exec_row["observation.state"]
+        # Future state conditioning (aligned with official VLASH):
+        # - delta == 0: keep recorded observation.state at t (matches sync cold start)
+        # - delta > 0:
+        #     * vlash_use_state_ground_truth=False (default): proxy future state = a_{t+delta-1}
+        #     * vlash_use_state_ground_truth=True: recorded future sensor s_{t+delta}
+        if effective_delay > 0 and "observation.state" in item:
+            if self.vlash_use_state_ground_truth:
+                rel_exec = self._to_relative_index(abs_exec)
+                exec_row = self.hf_dataset[rel_exec]
+                if "observation.state" in exec_row:
+                    item["observation.state"] = exec_row["observation.state"]
+            else:
+                abs_prev_action = max(ep_start, min(ep_end - 1, abs_exec - 1))
+                rel_prev_action = self._to_relative_index(abs_prev_action)
+                prev_action = self.hf_dataset[rel_prev_action]["action"]
+                obs_state = item["observation.state"]
+                if obs_state.ndim != 1 or prev_action.ndim != 1:
+                    raise ValueError(
+                        f"VLASH action-proxy state requires 1D state/action, got "
+                        f"state={tuple(obs_state.shape)} action={tuple(prev_action.shape)}."
+                    )
+                if obs_state.shape[0] != prev_action.shape[0]:
+                    raise ValueError(
+                        f"VLASH action-proxy state requires state_dim == action_dim "
+                        f"({obs_state.shape[0]} != {prev_action.shape[0]}). "
+                        "Set vlash_use_state_ground_truth=True for mismatched dimensions."
+                    )
+                item["observation.state"] = prev_action
 
         # Action chunk [t + delta, ..., t + delta + chunk_size - 1]
         action_indices = [

@@ -70,6 +70,39 @@ def compute_exact_vector_stats(arr: np.ndarray) -> dict[str, np.ndarray]:
     return stats
 
 
+def build_vlash_ref_states(
+    states: np.ndarray,
+    actions: np.ndarray,
+    *,
+    use_action_proxy: bool = True,
+    zero_delay_prob: float = 0.1,
+) -> np.ndarray:
+    """Build per-frame VLASH conditioning reference states matching training distribution.
+
+    When ``use_action_proxy=True`` (official VLASH default, ``vlash_use_state_ground_truth=False``):
+      - Frame 0 (or ``delta == 0`` with probability ``zero_delay_prob``) uses recorded ``s_t``.
+      - All ``delta > 0`` frames use previous commanded target ``a_{t-1}``.
+    Uses a deterministic periodic selection so statistics are reproducible with zero extra memory.
+    """
+    if not use_action_proxy or states.shape[0] <= 1:
+        return states.copy()
+
+    ep_len = states.shape[0]
+    ref_states = np.empty_like(states)
+    ref_states[0] = states[0]
+    ref_states[1:] = actions[:-1]
+
+    p = float(np.clip(zero_delay_prob, 0.0, 1.0))
+    if p >= 1.0:
+        return states.copy()
+    if p > 0.0:
+        # Deterministic floor-based selection matching exact density p over t >= 1
+        t = np.arange(1, ep_len, dtype=np.float64)
+        use_sensor = (np.floor(t * p) > np.floor((t - 1.0) * p))
+        ref_states[1:][use_sensor] = states[1:][use_sensor]
+    return ref_states
+
+
 def compute_episode_rel_actions(
     states: np.ndarray,
     actions: np.ndarray,
@@ -77,17 +110,25 @@ def compute_episode_rel_actions(
     chunk_size: int,
     action_mask: np.ndarray,
     include_padded_tail: bool = False,
-) -> np.ndarray:
+    use_action_proxy: bool = True,
+    zero_delay_prob: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
     ep_len = states.shape[0]
+    ref_states = build_vlash_ref_states(
+        states,
+        actions,
+        use_action_proxy=use_action_proxy,
+        zero_delay_prob=zero_delay_prob,
+    )
     t_idx = np.arange(ep_len)[:, None]
     k_idx = np.arange(chunk_size)[None, :]
     step_idx = t_idx + k_idx
     clamped_idx = np.minimum(step_idx, ep_len - 1)
-    ref = np.where(action_mask, states, 0.0)[:, None, :]
+    ref = np.where(action_mask, ref_states, 0.0)[:, None, :]
     rel_chunks = actions[clamped_idx] - ref
     if include_padded_tail:
-        return rel_chunks.reshape(-1, actions.shape[1])
-    return rel_chunks[step_idx < ep_len]
+        return ref_states, rel_chunks.reshape(-1, actions.shape[1])
+    return ref_states, rel_chunks[step_idx < ep_len]
 
 
 def protect_stationary_dims(
@@ -151,6 +192,17 @@ def main() -> None:
     parser.add_argument("--arm-min-range", type=float, default=0.1)
     parser.add_argument("--arm-min-std", type=float, default=0.02)
     parser.add_argument(
+        "--use-state-ground-truth",
+        action="store_true",
+        help="Use recorded sensor s_t instead of official VLASH action proxy a_{t-1} for relative stats.",
+    )
+    parser.add_argument(
+        "--zero-delay-prob",
+        type=float,
+        default=0.1,
+        help="Probability of delta=0 (sensor state) mixed with delta>0 (action proxy) when computing stats.",
+    )
+    parser.add_argument(
         "--include-padded-tail-in-stats",
         action="store_true",
         help="Include clamped episode-tail actions in relative stats (off by default to match mask_action_pad=true).",
@@ -192,19 +244,22 @@ def main() -> None:
     all_states: list[np.ndarray] = []
     all_rel_actions: list[np.ndarray] = []
 
+    use_action_proxy = not bool(args.use_state_ground_truth)
     for from_idx, to_idx in zip(from_ids, to_ids, strict=True):
         ep = ds.hf_dataset.select(np.arange(from_idx, to_idx))
         states = torch.stack(ep["observation.state"][:]).numpy().astype(np.float64)
         actions = torch.stack(ep["action"][:]).numpy().astype(np.float64)
-        all_states.append(states)
 
-        rel_ep = compute_episode_rel_actions(
+        ref_states, rel_ep = compute_episode_rel_actions(
             states,
             actions,
             chunk_size=args.chunk_size,
             action_mask=action_mask,
             include_padded_tail=args.include_padded_tail_in_stats,
+            use_action_proxy=use_action_proxy,
+            zero_delay_prob=args.zero_delay_prob,
         )
+        all_states.append(ref_states)
         if rel_runner is not None:
             rel_runner.update(rel_ep)
         else:
@@ -245,8 +300,11 @@ def main() -> None:
         json.dump(stats_json, f, ensure_ascii=False, indent=4)
 
     logging.info(
-        "Recomputed relative stats (chunk_size=%d, include_padded_tail=%s, mask=%s) -> %s",
+        "Recomputed relative stats (chunk_size=%d, use_action_proxy=%s, zero_delay_prob=%.2f, "
+        "include_padded_tail=%s, mask=%s) -> %s",
         args.chunk_size,
+        use_action_proxy,
+        args.zero_delay_prob,
         args.include_padded_tail_in_stats,
         action_mask.tolist(),
         stats_path,

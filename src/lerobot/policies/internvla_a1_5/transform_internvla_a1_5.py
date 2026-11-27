@@ -77,6 +77,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
     state_dropout_prob: float = 0.0
     vlash_condition_on_delay: bool = False
     eval_output_tag: str = "<Subtask, Action>"
+    eval_pad_length: int | None = None
 
     use_fast_action_tokens: bool = True
     action_text_key: str = "action.action_text"
@@ -246,10 +247,22 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
                 text_prompt = self.processor.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
-                inputs_full = self.processor(
-                    text=[text_prompt], images=images, do_rescale=False,
-                    return_tensors="pt", padding=False,
-                )
+                if self.eval_pad_length is not None and self.eval_pad_length > 0:
+                    inputs_full = self.processor(
+                        text=[text_prompt], images=images, do_rescale=False,
+                        return_tensors="pt", padding="max_length",
+                        max_length=self.eval_pad_length, truncation=True,
+                    )
+                    if bool(inputs_full.attention_mask[0, -1].item()):
+                        logging.warning(
+                            "Eval prompt filled eval_pad_length=%d (may be truncated); increase eval_pad_length.",
+                            self.eval_pad_length,
+                        )
+                else:
+                    inputs_full = self.processor(
+                        text=[text_prompt], images=images, do_rescale=False,
+                        return_tensors="pt", padding=False,
+                    )
             input_ids = inputs_full.input_ids[0]
             attention_mask = inputs_full.attention_mask[0]
             labels = torch.full_like(input_ids, -100)

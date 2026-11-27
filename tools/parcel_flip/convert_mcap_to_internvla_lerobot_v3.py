@@ -1488,6 +1488,32 @@ def aggregate_video_stats(
     return out
 
 
+def build_vlash_ref_states(
+    states: np.ndarray,
+    actions: np.ndarray,
+    *,
+    use_action_proxy: bool = True,
+    zero_delay_prob: float = 0.1,
+) -> np.ndarray:
+    """Build per-frame VLASH reference states matching official VLASH action-proxy training."""
+    if not use_action_proxy or states.shape[0] <= 1:
+        return states.copy()
+
+    ep_len = states.shape[0]
+    ref_states = np.empty_like(states)
+    ref_states[0] = states[0]
+    ref_states[1:] = actions[:-1]
+
+    p = float(np.clip(zero_delay_prob, 0.0, 1.0))
+    if p >= 1.0:
+        return states.copy()
+    if p > 0.0:
+        t = np.arange(1, ep_len, dtype=np.float64)
+        use_sensor = (np.floor(t * p) > np.floor((t - 1.0) * p))
+        ref_states[1:][use_sensor] = states[1:][use_sensor]
+    return ref_states
+
+
 def compute_episode_rel_actions(
     states: np.ndarray,
     actions: np.ndarray,
@@ -1495,18 +1521,28 @@ def compute_episode_rel_actions(
     chunk_size: int,
     action_mask: np.ndarray,
     include_padded_tail: bool = False,
+    use_action_proxy: bool = True,
+    zero_delay_prob: float = 0.1,
 ) -> np.ndarray:
     """Vectorized computation of chunk-relative actions for one episode.
 
+    When `use_action_proxy=True` (default, matching official VLASH `vlash_use_state_ground_truth=False`),
+    arm joints are referenced to `a_{t-1}` for `delta > 0` (and `s_t` on `zero_delay_prob` frames).
     When `include_padded_tail=False` (default, matching `mask_action_pad: true`),
     only non-padded timesteps (`t + k < ep_len`) contribute to action statistics.
     """
     ep_len = states.shape[0]
+    ref_states = build_vlash_ref_states(
+        states,
+        actions,
+        use_action_proxy=use_action_proxy,
+        zero_delay_prob=zero_delay_prob,
+    )
     t_idx = np.arange(ep_len)[:, None]
     k_idx = np.arange(chunk_size)[None, :]
     step_idx = t_idx + k_idx
     clamped_idx = np.minimum(step_idx, ep_len - 1)
-    ref = np.where(action_mask, states, 0.0)[:, None, :]
+    ref = np.where(action_mask, ref_states, 0.0)[:, None, :]
     rel_chunks = actions[clamped_idx] - ref
     if include_padded_tail:
         return rel_chunks.reshape(-1, actions.shape[1])
@@ -1554,6 +1590,7 @@ def compute_final_global_stats(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read episode parquets via chunk/file indices and compute float64 abs + VLASH relative stats."""
     all_states: list[np.ndarray] = []
+    all_vlash_ref_states: list[np.ndarray] = []
     all_abs_actions: list[np.ndarray] = []
     scalar_cols: dict[str, list[np.ndarray]] = {
         "timestamp": [],
@@ -1593,6 +1630,7 @@ def compute_final_global_stats(
         states = np.asarray(tbl[OBS_STATE].to_pylist(), dtype=np.float64)
         actions = np.asarray(tbl[ACTION].to_pylist(), dtype=np.float64)
         all_states.append(states)
+        all_vlash_ref_states.append(build_vlash_ref_states(states, actions))
         all_abs_actions.append(actions)
         for col in scalar_cols:
             scalar_cols[col].append(np.asarray(tbl[col].to_numpy(), dtype=np.float64))
@@ -1610,10 +1648,17 @@ def compute_final_global_stats(
             all_rel_actions.append(rel_ep)
 
     states_cat = np.concatenate(all_states, axis=0)
+    vlash_ref_states_cat = np.concatenate(all_vlash_ref_states, axis=0)
     abs_actions_cat = np.concatenate(all_abs_actions, axis=0)
 
     state_stats = protect_stationary_dims(
         compute_exact_vector_stats(states_cat),
+        action_mask=ACTION_MASK,
+        arm_min_range=arm_min_range,
+        arm_min_std=arm_min_std,
+    )
+    vlash_state_stats = protect_stationary_dims(
+        compute_exact_vector_stats(vlash_ref_states_cat),
         action_mask=ACTION_MASK,
         arm_min_range=arm_min_range,
         arm_min_std=arm_min_std,
@@ -1646,6 +1691,7 @@ def compute_final_global_stats(
     abs_stats[ACTION] = {k: v.tolist() for k, v in abs_action_stats.items()}
 
     rel_stats = dict(base_stats)
+    rel_stats[OBS_STATE] = {k: v.tolist() for k, v in vlash_state_stats.items()}
     rel_stats[ACTION] = {k: v.tolist() for k, v in rel_action_stats.items()}
     return rel_stats, abs_stats
 

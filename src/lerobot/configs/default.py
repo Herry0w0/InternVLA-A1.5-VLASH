@@ -50,6 +50,7 @@ class DatasetConfig(draccus.ChoiceRegistry, abc.ABC):
     vlash_max_delay_steps: int = 12
     vlash_zero_delay_prob: float = 0.1
     vlash_condition_on_delay: bool = True
+    vlash_use_state_ground_truth: bool = False  # False (official VLASH): use a_{t+delta-1} when delta>0; True: use recorded s_{t+delta}
     wan_video_span_steps: int | None = None
     enable_head_history: bool = False
     head_history_gap: int = 4

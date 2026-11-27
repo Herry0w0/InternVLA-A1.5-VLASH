@@ -395,6 +395,7 @@ def _build_single_dataset(
                 vlash_min_delay_steps=getattr(cfg.dataset, "vlash_min_delay_steps", 1),
                 vlash_max_delay_steps=getattr(cfg.dataset, "vlash_max_delay_steps", 12),
                 vlash_zero_delay_prob=getattr(cfg.dataset, "vlash_zero_delay_prob", 0.1),
+                vlash_use_state_ground_truth=getattr(cfg.dataset, "vlash_use_state_ground_truth", False),
                 wan_video_span_steps=getattr(cfg.dataset, "wan_video_span_steps", None),
                 enable_head_history=getattr(cfg.dataset, "enable_head_history", False),
                 head_history_gap=getattr(cfg.dataset, "head_history_gap", 4),

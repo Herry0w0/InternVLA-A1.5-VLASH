@@ -42,6 +42,7 @@ dataset:
   vlash_max_delay_steps: 12       # 30Hz 下覆盖最高 400ms 推理延迟
   vlash_zero_delay_prob: 0.1      # 10% 概率 δ=0（贴近原论文均匀分布并保留冷启动），90% 均匀采样 [min, max]
   vlash_condition_on_delay: true  # 在 VLM 提示词中显式注入 "; Delay: <δ>"，解决静态臂拦截动态包裹的不可辨识性
+  vlash_use_state_ground_truth: false  # 对齐官方 VLASH：δ=0 用真实传感器 s_t，δ>0 用前一步指令 a_{t+δ-1}，消除 Galbot ~2 帧伺服滞后失配
   wan_video_span_steps: 42        # 固定 42 帧（chunk_size+max_delay）WAN 未来视频跨度，不随 δ 随机拉伸
   enable_head_history: false      # 沿用标准 3 路相机（head_right / left_arm / right_arm），避免 +33% VLM 延迟
   head_history_gap: 4
@@ -120,26 +121,27 @@ policy:
   freeze_learnable_tokens: false  # 固定 WAN 跨度后可安全微调 50 个前瞻查询 token 适配动态传送带场景
   num_learnable_tokens: 50
 
-  # ---- 优化器与学习率调度（单卡 BS=8 默认 lr=2.5e-5；若 4 卡 BS=32 可通过 CLI 覆盖为 5e-5）----
-  optimizer_lr: 2.5e-5
+  # ---- 优化器与学习率调度（对齐论文 Table 1 Posttrain：4 卡 × BS=8 × grad_accum=4 = 全局 BS=128）----
+  optimizer_lr: 5.0e-5
   optimizer_betas: [0.9, 0.95]
   optimizer_eps: 1.0e-8
   optimizer_weight_decay: 0.01
   optimizer_grad_clip_norm: 1.0
-  scheduler_warmup_steps: 1000
-  scheduler_decay_steps: 30000
-  scheduler_decay_lr: 2.5e-6
+  scheduler_warmup_steps: 500     # ~5.5% 总步数（~0.85 epoch），避免短程微调在 warmup 期耗掉过多步数
+  scheduler_decay_steps: 9000     # 与 steps 对齐：9000 × 128 / 75157 ≈ 15.33 epochs
+  scheduler_decay_lr: 5.0e-6
 
 output_dir: /mnt/data3/jiangxirui/train_outputs/internvla_a15_vlash_conveyor
 job_name: internvla_a15_vlash_conveyor_delta_3cam
 
 seed: 42
-batch_size: 8
+batch_size: 8                     # 单卡 micro-batch=8（4 卡 DDP 下 BS=16 峰值触及 83GB OOM，BS=8 留足 ~20GB 安全余量）
+gradient_accumulation_steps: 4    # 4 卡 × 8 × 4 = 128 全局 Batch Size（与官方 Table 1 Posttrain 数学完全一致）
 num_workers: 8
-steps: 30000
-log_freq: 50
+steps: 9000                       # 9000 优化器步 × 128 = 1,152,000 样本 ≈ 15.33 epochs
+log_freq: 20
 # 注意: lerobot_train.py 当前不包含在线评估循环，离线开环评估请使用 tests/openloop_internvla_a1_5.py
-save_freq: 5000
+save_freq: 1500                   # 每 ~2.55 epoch 保存一次 ckpt（1500/3000/4500/6000/7500/9000）
 save_checkpoint: true
 use_policy_training_preset: true
 

@@ -386,32 +386,35 @@ class InternVLAA15Optimized(InternVLAA15):
             "prefix_kv_list": static_kv_list,
         }
 
-        torch.cuda.synchronize()
-        for _ in range(2):
-            self._denoise_step_fast(
-                buffers["state"],
-                buffers["prefix_pad_masks"],
-                buffers["prefix_kv_list"],
-                buffers["max_prefix_position_ids"],
-                buffers["x_t"],
-                buffers["timestep"],
-                attention_mask_4d=buffers["attention_mask_4d"],
-                position_ids=buffers["position_ids"],
-            )
-        torch.cuda.synchronize()
+        # Disable AMP autocast during CUDA Graph capture so PyTorch's ephemeral
+        # autocast weight cache cannot leave dangling device pointers on replay.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            torch.cuda.synchronize()
+            for _ in range(2):
+                self._denoise_step_fast(
+                    buffers["state"],
+                    buffers["prefix_pad_masks"],
+                    buffers["prefix_kv_list"],
+                    buffers["max_prefix_position_ids"],
+                    buffers["x_t"],
+                    buffers["timestep"],
+                    attention_mask_4d=buffers["attention_mask_4d"],
+                    position_ids=buffers["position_ids"],
+                )
+            torch.cuda.synchronize()
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_output = self._denoise_step_fast(
-                buffers["state"],
-                buffers["prefix_pad_masks"],
-                buffers["prefix_kv_list"],
-                buffers["max_prefix_position_ids"],
-                buffers["x_t"],
-                buffers["timestep"],
-                attention_mask_4d=buffers["attention_mask_4d"],
-                position_ids=buffers["position_ids"],
-            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_output = self._denoise_step_fast(
+                    buffers["state"],
+                    buffers["prefix_pad_masks"],
+                    buffers["prefix_kv_list"],
+                    buffers["max_prefix_position_ids"],
+                    buffers["x_t"],
+                    buffers["timestep"],
+                    attention_mask_4d=buffers["attention_mask_4d"],
+                    position_ids=buffers["position_ids"],
+                )
 
         buffers["output"] = static_output
         self._graphs[graph_key] = graph
@@ -504,11 +507,12 @@ class InternVLAA15Optimized(InternVLAA15):
         x_t = noise.float()
         time_val = 1.0
 
-        for _ in range(num_steps):
-            buffers["x_t"].copy_(x_t)
-            buffers["timestep"].fill_(time_val)
-            graph.replay()
-            x_t = x_t + dt * buffers["output"]
-            time_val += dt
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            for _ in range(num_steps):
+                buffers["x_t"].copy_(x_t)
+                buffers["timestep"].fill_(time_val)
+                graph.replay()
+                x_t = x_t + dt * buffers["output"]
+                time_val += dt
 
         return x_t

@@ -55,6 +55,7 @@ def main() -> None:
     policy.to(device)
     policy.eval()
 
+    eval_pad_length = (416 if args.num_views <= 3 else 512) if args.backend == "optimized" else None
     processor = InternVLAA15ChatProcessorTransformFn(
         pretrained_model_name_or_path=str(args.vlm_path),
         max_length=650 if args.num_views <= 3 else 800,
@@ -64,6 +65,7 @@ def main() -> None:
         norm_mode="mean_std",
         vlash_condition_on_delay=True,
         eval_output_tag="<Action>",
+        eval_pad_length=eval_pad_length,
         use_fast_action_tokens=False,
         mode="eval",
         action_mode="joint",
@@ -91,19 +93,23 @@ def main() -> None:
         else:
             batch[k] = v.unsqueeze(0).to(device=device, dtype=dtype)
 
-    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+    with torch.no_grad():
         for _ in range(args.warmup):
-            _ = policy.predict_action_chunk(batch)
+            out = policy.predict_action_chunk(batch)
+            if not torch.isfinite(out).all():
+                raise RuntimeError("Non-finite action output detected during warmup!")
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
         latencies_ms = []
         for _ in range(args.iters):
             t0 = time.perf_counter()
-            _ = policy.predict_action_chunk(batch)
+            out = policy.predict_action_chunk(batch)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+            if not torch.isfinite(out).all():
+                raise RuntimeError("Non-finite action output detected during benchmark!")
 
     arr = np.asarray(latencies_ms, dtype=np.float64)
     p50 = float(np.percentile(arr, 50))

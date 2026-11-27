@@ -54,7 +54,7 @@ from lerobot.utils.utils import (
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
-    batch: Any,
+    batches: Any,
     optimizer: Optimizer,
     grad_clip_norm: float,
     accelerator: Accelerator,
@@ -62,36 +62,46 @@ def update_policy(
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
     """
-    Performs a single training step to update the policy's weights.
+    Performs a single optimizer step (supporting 1 or more micro-batches via gradient accumulation).
 
-    This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
-
-    Args:
-        train_metrics: A MetricsTracker instance to record training statistics.
-        policy: The policy model to be trained.
-        batch: A batch of training data.
-        optimizer: The optimizer used to update the policy's parameters.
-        grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
-        lr_scheduler: An optional learning rate scheduler.
-        lock: An optional lock for thread-safe optimizer updates.
-
-    Returns:
-        A tuple containing:
-        - The updated MetricsTracker with new statistics for this step.
-        - A dictionary of outputs from the policy's forward pass, for logging purposes.
+    Uses ``accelerator.no_sync(policy)`` on intermediate micro-batches to avoid redundant DDP
+    AllReduce synchronization, averaging the loss by ``len(batches)`` so gradients match a true
+    large batch.
     """
     start_time = time.perf_counter()
     policy.train()
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        loss, output_dict = policy.forward(batch)
+    micro_batches = batches if isinstance(batches, (list, tuple)) else [batches]
+    grad_accum = len(micro_batches)
+    if grad_accum < 1:
+        raise ValueError("update_policy requires at least one micro-batch.")
 
+    total_loss = 0.0
+    accum_outputs: dict[str, float] = {}
+    accum_counts: dict[str, int] = {}
+    vlash_delays: list[float] = []
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+    for micro_idx, batch in enumerate(micro_batches):
+        sync_ctx = (
+            accelerator.no_sync(policy)
+            if (grad_accum > 1 and micro_idx < grad_accum - 1)
+            else nullcontext()
+        )
+        with sync_ctx:
+            with accelerator.autocast():
+                loss, micro_out = policy.forward(batch)
+            accelerator.backward(loss / grad_accum)
+
+        total_loss += float(loss.item()) / grad_accum
+        if micro_out:
+            for k, v in micro_out.items():
+                if isinstance(v, (int, float)):
+                    accum_outputs[k] = accum_outputs.get(k, 0.0) + float(v)
+                    accum_counts[k] = accum_counts.get(k, 0) + 1
+        if "vlash_delay_steps" in batch:
+            vlash_delays.append(float(batch["vlash_delay_steps"].float().mean().item()))
+
+    output_dict = {k: accum_outputs[k] / accum_counts[k] for k in accum_outputs}
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -107,7 +117,7 @@ def update_policy(
 
     optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
+    # Step through pytorch scheduler at every optimizer step
     if lr_scheduler is not None:
         lr_scheduler.step()
 
@@ -115,7 +125,7 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
+    train_metrics.loss = total_loss
     if "loss_action" in output_dict:
         train_metrics.loss_action = output_dict["loss_action"]
     if "loss_action_real" in output_dict and hasattr(train_metrics, "loss_action_real"):
@@ -128,8 +138,8 @@ def update_policy(
         train_metrics.loss_fast = output_dict["loss_fast"]
     if "loss_subtask" in output_dict:
         train_metrics.loss_subtask = output_dict["loss_subtask"]
-    if "vlash_delay_steps" in batch:
-        vlash_delay_val = float(batch["vlash_delay_steps"].float().mean().item())
+    if vlash_delays:
+        vlash_delay_val = sum(vlash_delays) / len(vlash_delays)
         output_dict["vlash_mean_delay"] = vlash_delay_val
         if hasattr(train_metrics, "vlash_delay"):
             train_metrics.vlash_delay = vlash_delay_val
@@ -262,14 +272,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         num_frames = dataset.num_frames
         num_episodes = dataset.num_episodes
     num_processes = accelerator.num_processes
-    effective_bs = cfg.batch_size * num_processes
+    grad_accum = max(1, int(cfg.gradient_accumulation_steps))
+    effective_bs = cfg.batch_size * num_processes * grad_accum
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"\033[91m\033[1mnum_frames={num_frames} ({format_big_number(num_frames)})\033[0m")
         logging.info(f"\033[91m\033[1mnum_episodes={num_episodes} ({format_big_number(num_episodes)})\033[0m")
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        logging.info(
+            f"Effective batch size: {cfg.batch_size} (per-GPU) x {num_processes} (GPUs) x {grad_accum} (grad_accum) = {effective_bs}"
+        )
         logging.info(f"policy info:\n{policy}")
 
     # create dataloader for offline training
@@ -325,8 +338,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["vlash_delay"] = AverageMeter("vlash_d", ":.2f")
 
 
-    # Use effective batch size for proper epoch calculation in distributed training
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    # Use effective batch size (including gradient accumulation) for proper epoch calculation
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * grad_accum
     train_tracker = MetricsTracker(
         effective_batch_size,
         num_frames,
@@ -342,15 +355,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        if cfg.dataset.dist_loading or dl_self_managed:
-            batch = send_to_device(batch, accelerator.device, non_blocking=True)
+        micro_batches = []
+        for _micro in range(grad_accum):
+            batch = next(dl_iter)
+            if cfg.dataset.dist_loading or dl_self_managed:
+                batch = send_to_device(batch, accelerator.device, non_blocking=True)
+            micro_batches.append(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
-            batch,
+            micro_batches,
             optimizer,
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,

@@ -1,21 +1,24 @@
 """VLASH (Future-State-Aware Asynchronous Inference) Runtime for InternVLA-A1.5.
 
 Implements:
-  1. Future-state roll-forward (VLASH, arXiv:2512.01031) with optional servo tracking-lag
-     compensation between commanded targets (`singorix/wbcs/target`) and measured sensors
-     (`singorix/wbcs/sensor`).
-  2. Explicit delay prompt conditioning (`; Delay: <delta>`) & exact training-time prompt
-     parity (`; Output: <Action>`, `mean_std` or `q01_q99` normalization, 224x224 letterbox).
-  3. Zero-WAN optimized CUDA-Graph inference (`action_loss_only=True`,
-     `inference_backend="optimized"`).
-  4. Optional VLASH Action Quantization (`action_quant_ratio >= 1`) and Galbot SDK
-     right-arm-first / left-arm-first adapter.
+  1. Future-state roll-forward (VLASH, arXiv:2512.01031) aligned with official VLASH action-proxy
+     training (`vlash_use_state_ground_truth=False`: `delta == 0` uses sensor `s_t`, `delta > 0`
+     uses committed target `a_{t+delta-1}` with zero servo-lag mismatch).
+  2. Exact zero-off-by-one control loop timing: plans next async inference at step `t` using `o_t`
+     BEFORE popping `a_t`, so `handover_step = t + d` and `future_state = a_{t+d-1}`.
+  3. Constant-length eval prompt padding (`eval_pad_length`) + explicit `warmup()` so
+     `InternVLAA15Optimized` captures exactly ONE CUDA Graph without live recaptures or VRAM leaks.
+  4. Thread-safe background inference with `_infer_lock` (preventing concurrent CUDA Graph buffer
+     access when the queue empties) and immutable camera frame snapshots.
+  5. Exact `action_quant_ratio` scaling for both `; Delay: <delta>` and trigger thresholds, plus
+     optional explicit `n_action_steps` execution horizon (matching official `vlash/run.py`).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -94,23 +97,52 @@ def quantize_action_chunk(chunk: np.ndarray, quant_ratio: int = 1) -> np.ndarray
     return chunk[indices]
 
 
+def quantized_chunk_length(chunk_size: int, quant_ratio: int = 1) -> int:
+    """Exact number of execution ticks produced by ``quantize_action_chunk``."""
+    n = max(1, int(chunk_size))
+    q = max(1, int(quant_ratio))
+    if q <= 1:
+        return n
+    return int(math.ceil(n / q))
+
+
 @dataclass
 class VLASHRollForwardResult:
-    """Result of planning an asynchronous VLASH inference call."""
+    """Result of planning an asynchronous VLASH inference call.
+
+    Attributes:
+        future_state: 16-dim absolute conditioning state (`s_t` on cold start, else `a_{t+d-1}`).
+        delay_steps: Delay in model/training step units (`delay_ticks * action_quant_ratio`),
+            injected into the prompt as ``; Delay: <delay_steps>``.
+        trigger_step: Control-loop tick `t` at which the observation `o_t` was captured.
+        handover_step: Control-loop tick `t + delay_ticks` at which the predicted chunk takes over.
+        delay_ticks: Delay in control-loop execution ticks (`handover_step - trigger_step`).
+    """
 
     future_state: np.ndarray
     delay_steps: int
     trigger_step: int
     handover_step: int
+    delay_ticks: int = 0
+
+    def __post_init__(self) -> None:
+        if self.delay_ticks == 0 and self.handover_step > self.trigger_step:
+            self.delay_ticks = self.handover_step - self.trigger_step
 
 
 class VLASHFutureStateController:
     """Pure-Python/NumPy controller for VLASH future-state roll-forward & async chunk handover.
 
     Maintains:
-      - Current global control step counter ``step``
+      - Current global control tick counter ``step``
       - Committed action buffer ``_action_queue`` (each entry is a 16-dim absolute target)
       - Exponential moving average of inference latency ``ema_infer_s``
+
+    Note on ``action_quant_ratio``:
+      For dynamic moving-conveyor tasks, keep ``action_quant_ratio = 1`` so the action timeline
+      stays 1:1 locked to physical conveyor velocity and ``; Delay: <delta>``. If ``q > 1`` is
+      used, both ``delay_steps`` (scaled by ``q``) and trigger thresholds (in quantized ticks)
+      are converted consistently following official VLASH commit ``96aafb5``.
     """
 
     def __init__(
@@ -118,6 +150,7 @@ class VLASHFutureStateController:
         *,
         fps: float = 30.0,
         chunk_size: int = 30,
+        n_action_steps: int | None = None,
         min_delay_steps: int = 0,
         max_delay_steps: int = 12,
         fixed_delay_steps: int | None = None,
@@ -129,6 +162,11 @@ class VLASHFutureStateController:
     ) -> None:
         self.fps = float(fps)
         self.chunk_size = int(chunk_size)
+        self.n_action_steps = (
+            max(1, min(self.chunk_size, int(n_action_steps)))
+            if n_action_steps is not None
+            else None
+        )
         self.min_delay_steps = max(0, int(min_delay_steps))
         self.max_delay_steps = max(0, int(max_delay_steps))
         self.fixed_delay_steps = fixed_delay_steps
@@ -136,7 +174,7 @@ class VLASHFutureStateController:
         self.action_quant_ratio = max(1, int(action_quant_ratio))
         self.latency_ema_alpha = float(latency_ema_alpha)
         self.ema_infer_s = float(initial_latency_s)
-        # Trigger next async inference early enough that remaining committed steps >= delay + safety
+        # Optional explicit remaining-tick threshold to launch next async inference
         self.min_remaining_to_trigger = min_remaining_to_trigger
 
         self.step: int = 0
@@ -155,38 +193,62 @@ class VLASHFutureStateController:
         a = self.latency_ema_alpha
         self.ema_infer_s = a * infer_s + (1.0 - a) * self.ema_infer_s
 
-    def estimate_delay_steps(self) -> int:
+    @property
+    def effective_chunk_ticks(self) -> int:
+        return quantized_chunk_length(self.chunk_size, self.action_quant_ratio)
+
+    def estimate_delay_ticks(self) -> int:
+        """Estimate inference overlap delay in control-loop execution ticks."""
+        q = self.action_quant_ratio
+        max_ticks = self.max_delay_steps // q if q > 1 else self.max_delay_steps
+        min_ticks = int(math.ceil(self.min_delay_steps / q)) if self.min_delay_steps > 0 else 0
+        min_ticks = min(min_ticks, max_ticks)
+
         if self.fixed_delay_steps is not None:
-            return max(0, min(self.max_delay_steps, int(self.fixed_delay_steps)))
-        est = int(round(self.ema_infer_s * self.fps))
-        return max(self.min_delay_steps, min(self.max_delay_steps, est))
+            raw_ticks = int(self.fixed_delay_steps)
+            return max(0, min(max_ticks, raw_ticks))
+
+        est_ticks = int(round(self.ema_infer_s * self.fps))
+        return max(min_ticks, min(max_ticks, est_ticks))
+
+    def estimate_delay_steps(self) -> int:
+        """Estimate inference delay in model/training step units (ticks * action_quant_ratio)."""
+        return min(self.max_delay_steps, self.estimate_delay_ticks() * self.action_quant_ratio)
 
     def plan_future_state(self, current_sensor_state: np.ndarray) -> VLASHRollForwardResult:
-        """Roll forward ``current_sensor_state`` by ``delta`` committed actions.
+        """Roll forward ``current_sensor_state`` by ``delay_ticks`` committed actions.
 
-        When the committed queue has fewer than ``delta`` actions (e.g., cold start at step 0),
-        clamps ``delta`` to ``len(_action_queue)`` (0 on cold start -> synchronous first chunk).
-        If ``servo_lag_steps > 0``, looks slightly earlier in the committed target queue to match
-        the physical sensor tracking lag between commanded targets and measured joint positions.
+        Must be called at tick ``t`` BEFORE ``pop_action()`` pops ``a_t`` so that:
+          - ``queue[0]`` is ``a_t``, ..., ``queue[d-1]`` is ``a_{t+d-1}``
+          - ``future_state`` is ``a_{t+d-1}`` (when ``servo_lag_steps=0``, matching official VLASH)
+          - ``handover_step`` is ``t + d``
+          - ``delay_steps`` is ``d * action_quant_ratio`` (in training step units).
+
+        When the committed queue is empty (cold start at step 0), returns ``delay_steps=0``
+        and ``future_state=current_sensor_state`` for synchronous first-chunk bootstrap.
         """
         sensor = np.asarray(current_sensor_state, dtype=np.float32).copy()
-        desired_delay = self.estimate_delay_steps()
+        desired_ticks = self.estimate_delay_ticks()
         avail = len(self._action_queue)
 
-        if avail == 0 or desired_delay == 0:
+        if avail == 0 or desired_ticks == 0:
             plan = VLASHRollForwardResult(
                 future_state=sensor,
                 delay_steps=0,
                 trigger_step=self.step,
                 handover_step=self.step,
+                delay_ticks=0,
             )
             self._pending_plan = plan
             return plan
 
-        effective_delay = min(desired_delay, avail)
-        # Index in committed queue whose execution brings robot to t + effective_delay.
-        # Subtract servo_lag_steps when targets lead measured sensors by ~1-2 frames.
-        queue_idx = effective_delay - 1 - self.servo_lag_steps
+        effective_ticks = min(desired_ticks, avail)
+        model_delay_steps = min(self.max_delay_steps, effective_ticks * self.action_quant_ratio)
+
+        # Index in committed queue whose execution brings robot to tick t + effective_ticks.
+        # With official VLASH action-proxy training (vlash_use_state_ground_truth=False),
+        # servo_lag_steps=0 is exact (queue[effective_ticks - 1] == a_{t+d-1}).
+        queue_idx = effective_ticks - 1 - self.servo_lag_steps
         if queue_idx < 0:
             future_state = sensor
         else:
@@ -194,24 +256,40 @@ class VLASHFutureStateController:
 
         plan = VLASHRollForwardResult(
             future_state=future_state,
-            delay_steps=effective_delay,
+            delay_steps=model_delay_steps,
             trigger_step=self.step,
-            handover_step=self.step + effective_delay,
+            handover_step=self.step + effective_ticks,
+            delay_ticks=effective_ticks,
         )
         self._pending_plan = plan
         return plan
 
     def should_trigger_inference(self) -> bool:
-        """Return True when the controller should launch a new background inference."""
+        """Return True when the controller should launch a new background inference at tick ``t``."""
         if self._pending_plan is not None:
             return False
-        est_delay = self.estimate_delay_steps()
+        avail = len(self._action_queue)
+        if avail == 0:
+            return True
+
+        est_ticks = self.estimate_delay_ticks()
+        chunk_ticks = self.effective_chunk_ticks
+
         if self.min_remaining_to_trigger is not None:
-            threshold = self.min_remaining_to_trigger
+            threshold = int(self.min_remaining_to_trigger)
+        elif self.n_action_steps is not None:
+            # Official VLASH semantics: execute n_action_ticks per chunk, launching inference
+            # est_ticks before the chunk boundary (at tick n_action_ticks - est_ticks).
+            n_ticks = quantized_chunk_length(self.n_action_steps, self.action_quant_ratio)
+            n_ticks = max(est_ticks + 1, min(chunk_ticks, n_ticks))
+            executed_before_trigger = max(1, n_ticks - est_ticks)
+            threshold = max(est_ticks, chunk_ticks - executed_before_trigger)
         else:
-            # Leave enough committed actions to cover inference + 2-step jitter margin
-            threshold = max(est_delay + 2, self.chunk_size // 2)
-        return len(self._action_queue) <= threshold
+            # Leave enough committed ticks to cover inference + 2-tick jitter margin, while
+            # strictly capping below chunk_ticks so q > 1 never re-triggers on every tick.
+            threshold = min(max(1, chunk_ticks - 1), max(est_ticks + 2, chunk_ticks // 2))
+
+        return avail <= threshold
 
     def commit_predicted_chunk(
         self,
@@ -280,7 +358,8 @@ class VLASHAsyncInternVLAPolicy:
         device: str,
         dtype: torch.dtype,
         fps: float = 30.0,
-        min_delay_steps: int = 0,
+        n_action_steps: int | None = None,
+        min_delay_steps: int = 1,
         max_delay_steps: int = 12,
         fixed_delay_steps: int | None = None,
         servo_lag_steps: int = 0,
@@ -306,9 +385,17 @@ class VLASHAsyncInternVLAPolicy:
         self.sdk_right_arm_first = bool(sdk_right_arm_first)
         self.default_task = default_task
 
+        if int(action_quant_ratio) > 1:
+            logging.warning(
+                "action_quant_ratio=%d > 1 scales action timeline faster than physical conveyor speed; "
+                "for dynamic conveyor tasks, action_quant_ratio=1 is strongly recommended.",
+                int(action_quant_ratio),
+            )
+
         self.controller = VLASHFutureStateController(
             fps=fps,
             chunk_size=chunk_size,
+            n_action_steps=n_action_steps,
             min_delay_steps=min_delay_steps,
             max_delay_steps=max_delay_steps,
             fixed_delay_steps=fixed_delay_steps,
@@ -317,8 +404,10 @@ class VLASHAsyncInternVLAPolicy:
         )
         self._head_history: deque[torch.Tensor] = deque(maxlen=max(1, head_history_gap + 1))
         self._lock = threading.Lock()
+        self._infer_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._last_error: Exception | None = None
+        self._warmed_up: bool = False
 
     @classmethod
     def from_checkpoint(
@@ -329,9 +418,12 @@ class VLASHAsyncInternVLAPolicy:
         device: str = "cuda",
         inference_backend: str = "optimized",
         fps: float = 30.0,
+        n_action_steps: int | None = None,
         fixed_delay_steps: int | None = None,
         servo_lag_steps: int = 0,
         action_quant_ratio: int = 1,
+        eval_pad_length: int | None = None,
+        auto_warmup: bool = False,
         sdk_right_arm_first: bool = False,
         default_task: str = "Flip the parcel so the label faces up",
     ) -> VLASHAsyncInternVLAPolicy:
@@ -369,11 +461,17 @@ class VLASHAsyncInternVLAPolicy:
         action_mode = str(ds_cfg.get("action_mode", "delta"))
         vlash_enabled = bool(ds_cfg.get("vlash_enabled", True))
         vlash_condition_on_delay = bool(ds_cfg.get("vlash_condition_on_delay", True)) and vlash_enabled
+        vlash_min_delay = int(ds_cfg.get("vlash_min_delay_steps", 1))
         vlash_max_delay = int(ds_cfg.get("vlash_max_delay_steps", 12))
         enable_head_history = bool(ds_cfg.get("enable_head_history", False))
         head_history_gap = int(ds_cfg.get("head_history_gap", 4))
         max_prompt_length = int(ds_cfg.get("max_prompt_length", 650))
         eval_output_tag = str(ds_cfg.get("eval_output_tag", "<Action>"))
+
+        # Constant eval padding length prevents InternVLAA15Optimized from recapturing a new
+        # CUDA Graph every time digitized state/delay text token counts fluctuate.
+        if eval_pad_length is None and inference_backend == "optimized":
+            eval_pad_length = 512 if enable_head_history else 416
 
         # Load stats saved in checkpoint (or fallback to dataset root in train_config.json)
         stats_candidates = [
@@ -409,13 +507,14 @@ class VLASHAsyncInternVLAPolicy:
             norm_mode=norm_mode,
             vlash_condition_on_delay=vlash_condition_on_delay,
             eval_output_tag=eval_output_tag,
+            eval_pad_length=eval_pad_length,
             use_fast_action_tokens=False,
             mode="eval",
             action_mode=getattr(schema, "action_mode", "joint"),
         )
         compute_dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
 
-        return cls(
+        instance = cls(
             policy=policy,
             processor=processor,
             state_normalizer=state_normalizer,
@@ -428,6 +527,8 @@ class VLASHAsyncInternVLAPolicy:
             device=device,
             dtype=compute_dtype,
             fps=fps,
+            n_action_steps=n_action_steps,
+            min_delay_steps=vlash_min_delay,
             max_delay_steps=vlash_max_delay,
             fixed_delay_steps=fixed_delay_steps,
             servo_lag_steps=servo_lag_steps,
@@ -437,14 +538,68 @@ class VLASHAsyncInternVLAPolicy:
             sdk_right_arm_first=sdk_right_arm_first,
             default_task=default_task,
         )
+        if auto_warmup:
+            instance.warmup()
+        return instance
+
+    def warmup(self, num_iters: int = 3, task: str | None = None) -> float:
+        """Warm up VLM + CUDA Graph replay and initialize ``ema_infer_s`` with steady-state latency."""
+        dummy_img = np.zeros((224, 224, 3), dtype=np.uint8)
+        dummy_images = {
+            "head_right": dummy_img,
+            "left_arm": dummy_img,
+            "right_arm": dummy_img,
+        }
+        dummy_state = np.zeros(self.action_dim, dtype=np.float32)
+        latencies: list[float] = []
+        n = max(1, int(num_iters))
+        for _ in range(n):
+            _, infer_s = self._run_inference_sync(
+                images_rgb=dummy_images,
+                future_state=dummy_state,
+                delay_steps=0,
+                task=task or self.default_task,
+            )
+            latencies.append(infer_s)
+
+        # Exclude first graph-capture iteration when multiple warmup iterations are run
+        steady = latencies[1:] if len(latencies) > 1 else latencies
+        steady_median = float(np.median(steady))
+        with self._lock:
+            self.controller.ema_infer_s = steady_median
+            self._warmed_up = True
+        logging.info(
+            "VLASHAsyncInternVLAPolicy warmup complete (%d iters): first=%.1fms steady_median=%.1fms",
+            n,
+            latencies[0] * 1000.0,
+            steady_median * 1000.0,
+        )
+        return steady_median
 
     def reset(self) -> None:
-        if self._worker_thread is not None and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=2.0)
+        worker = self._worker_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=5.0)
         with self._lock:
             self.controller.reset()
             self._head_history.clear()
             self._last_error = None
+            self._worker_thread = None
+
+    @staticmethod
+    def _snapshot_images(
+        images_rgb: dict[str, np.ndarray | torch.Tensor],
+    ) -> dict[str, np.ndarray | torch.Tensor]:
+        """Deep-copy camera frame buffers so SDK reuse cannot tear frames read by worker thread."""
+        snap: dict[str, np.ndarray | torch.Tensor] = {}
+        for k, v in images_rgb.items():
+            if isinstance(v, np.ndarray):
+                snap[k] = np.array(v, copy=True)
+            elif isinstance(v, torch.Tensor):
+                snap[k] = v.detach().clone()
+            else:
+                snap[k] = v
+        return snap
 
     @staticmethod
     def _to_chw_float_tensor(img: np.ndarray | torch.Tensor, target_hw: int = 224) -> torch.Tensor:
@@ -471,6 +626,7 @@ class VLASHAsyncInternVLAPolicy:
         future_state: np.ndarray,
         delay_steps: int,
         task: str | None = None,
+        prev_head_frame: torch.Tensor | None = None,
     ) -> tuple[np.ndarray, float]:
         from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
@@ -490,7 +646,10 @@ class VLASHAsyncInternVLAPolicy:
             "vlash_delay_steps": torch.tensor(delay_steps, dtype=torch.long),
         }
         if self.enable_head_history:
-            prev_head = self._head_history[0] if len(self._head_history) > 0 else head
+            if prev_head_frame is not None:
+                prev_head = prev_head_frame
+            else:
+                prev_head = self._head_history[0] if len(self._head_history) > 0 else head
             sample[f"{OBS_IMAGES}.image3"] = prev_head
             sample[f"{OBS_IMAGES}.image3_mask"] = True
 
@@ -508,18 +667,18 @@ class VLASHAsyncInternVLAPolicy:
             else:
                 inputs[k] = v.unsqueeze(0).to(device=self.device, dtype=self.dtype)
 
-        t0 = time.perf_counter()
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        with torch.no_grad(), torch.amp.autocast(
-            device_type=self.device.type,
-            dtype=self.dtype,
-            enabled=(self.dtype != torch.float32),
-        ):
-            norm_chunk = self.policy.predict_action_chunk(inputs)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        infer_s = time.perf_counter() - t0
+        with self._infer_lock:
+            t0 = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            # Do NOT wrap InternVLAA15Optimized in torch.amp.autocast: Qwen3.5 VLM already holds
+            # native bf16 weights while the CUDA-Graphed Action Expert runs in native fp32, and
+            # autocast's ephemeral weight cache leaves dangling pointers across CUDA Graph replays.
+            with torch.no_grad():
+                norm_chunk = self.policy.predict_action_chunk(inputs)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            infer_s = time.perf_counter() - t0
 
         norm_np = norm_chunk[0, :, : self.action_dim].detach().float().cpu().numpy()
         unnorm_np = unnormalize_vector(norm_np, self.action_stats, mode=self.norm_mode)
@@ -536,6 +695,7 @@ class VLASHAsyncInternVLAPolicy:
         images_rgb: dict[str, np.ndarray | torch.Tensor],
         plan: VLASHRollForwardResult,
         task: str | None,
+        prev_head_frame: torch.Tensor | None = None,
     ) -> None:
         try:
             abs_chunk, infer_s = self._run_inference_sync(
@@ -543,10 +703,12 @@ class VLASHAsyncInternVLAPolicy:
                 future_state=plan.future_state,
                 delay_steps=plan.delay_steps,
                 task=task,
+                prev_head_frame=prev_head_frame,
             )
             with self._lock:
                 self.controller.update_latency(infer_s)
                 self.controller.commit_predicted_chunk(abs_chunk, plan)
+                self._warmed_up = True
         except Exception as exc:  # pragma: no cover
             logging.exception("[vlash_async_worker_error] %s", exc)
             with self._lock:
@@ -561,8 +723,13 @@ class VLASHAsyncInternVLAPolicy:
     ) -> np.ndarray:
         """Non-blocking real-time control tick returning a 16-dim absolute joint + gripper target.
 
-        Blocks only on cold start (when the action queue is completely empty); thereafter runs
-        inference asynchronously in a background thread using VLASH future-state roll-forward.
+        Blocks only on cold start (or if an in-flight background worker overran the entire queue,
+        in which case it safely joins the worker instead of racing on CUDA Graph buffers).
+
+        Timing invariant (zero off-by-one):
+          At tick ``t``, ``o_t`` triggers planning BEFORE ``a_t`` is popped, so
+          ``future_state = a_{t+d-1}`` and ``handover_step = t + d``, matching training
+          ``(o_t, a_{t+d-1}, Delay=d) -> A_{t+d:}``.
         """
         if self._last_error is not None:
             raise RuntimeError("Background VLASH inference failed") from self._last_error
@@ -572,38 +739,66 @@ class VLASHAsyncInternVLAPolicy:
             if self.sdk_right_arm_first
             else np.asarray(sensor_state, dtype=np.float32)
         )
+        prev_head_snapshot: torch.Tensor | None = None
         if self.enable_head_history:
             self._head_history.append(self._to_chw_float_tensor(images_rgb["head_right"]))
+            prev_head_snapshot = self._head_history[0].clone()
+
+        # Check if queue is empty while a background worker is still in flight; if so, join it
+        # cleanly rather than racing on InternVLAA15Optimized CUDA Graph static buffers.
+        worker_to_join: threading.Thread | None = None
+        with self._lock:
+            self.controller._maybe_handover()
+            if self.controller.queue_length == 0:
+                if self._worker_thread is not None and self._worker_thread.is_alive():
+                    worker_to_join = self._worker_thread
+
+        if worker_to_join is not None:
+            worker_to_join.join()
+            if self._last_error is not None:
+                raise RuntimeError("Background VLASH inference failed") from self._last_error
+
+        plan_async: VLASHRollForwardResult | None = None
+        plan_sync: VLASHRollForwardResult | None = None
+        action: np.ndarray | None = None
 
         with self._lock:
-            action = self.controller.pop_action()
-            need_trigger = self.controller.should_trigger_inference()
-            if action is None:
-                # Cold start: synchronous first inference with delay=0
-                plan = self.controller.plan_future_state(state_model)
-            elif need_trigger:
-                plan = self.controller.plan_future_state(state_model)
+            self.controller._maybe_handover()
+            if self.controller.queue_length == 0:
+                # Cold start (or fallback): synchronous inference with delay=0
+                plan_sync = self.controller.plan_future_state(state_model)
             else:
-                plan = None
+                # Normal async tick t: plan BEFORE popping a_t so handover_step = t + d
+                if self.controller.should_trigger_inference():
+                    plan_async = self.controller.plan_future_state(state_model)
+                action = self.controller.pop_action()
 
-        if action is None:
+        if plan_sync is not None:
             abs_chunk, infer_s = self._run_inference_sync(
                 images_rgb=images_rgb,
-                future_state=plan.future_state,
-                delay_steps=plan.delay_steps,
+                future_state=plan_sync.future_state,
+                delay_steps=plan_sync.delay_steps,
                 task=task,
+                prev_head_frame=prev_head_snapshot,
             )
             with self._lock:
-                self.controller.update_latency(infer_s)
-                self.controller.commit_predicted_chunk(abs_chunk, plan)
+                # Do not pollute EMA with un-warmed first CUDA Graph capture latency
+                if self._warmed_up:
+                    self.controller.update_latency(infer_s)
+                else:
+                    self._warmed_up = True
+                self.controller.commit_predicted_chunk(abs_chunk, plan_sync)
                 action = self.controller.pop_action()
-        elif plan is not None:
-            self._worker_thread = threading.Thread(
+        elif plan_async is not None:
+            images_snapshot = self._snapshot_images(images_rgb)
+            worker = threading.Thread(
                 target=self._background_worker,
-                args=(images_rgb, plan, task),
+                args=(images_snapshot, plan_async, task, prev_head_snapshot),
                 daemon=True,
             )
-            self._worker_thread.start()
+            with self._lock:
+                self._worker_thread = worker
+            worker.start()
 
         assert action is not None
         return swap_dual_arm_order(action) if self.sdk_right_arm_first else action
