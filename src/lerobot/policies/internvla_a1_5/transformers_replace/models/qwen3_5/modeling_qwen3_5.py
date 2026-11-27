@@ -364,15 +364,25 @@ def torch_chunk_gated_delta_rule(
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    if chunk_size > 0 and (chunk_size & (chunk_size - 1)) == 0:
+        # Exact nilpotent doubling for strictly lower-triangular (I - A)^(-1) = prod_{k=0}^{log2(C)-1} (I + A^{2^k})
+        eye = torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        power = attn
+        attn = eye + power
+        steps = chunk_size.bit_length() - 2
+        for _ in range(steps):
+            power = power @ power
+            attn = attn @ (eye + power)
+    else:
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -416,9 +426,9 @@ def torch_recurrent_gated_delta_rule(
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim, device=value.device, dtype=value.dtype)
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -944,11 +954,13 @@ class Qwen3_5VisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        # Mathematically identical to Conv3d(kernel_size=stride, padding=0) on flattened patches,
+        # avoiding catastrophic slow_conv3d_forward fallback on PyTorch builds without cuDNN.
+        return F.linear(
+            hidden_states.to(dtype=target_dtype),
+            self.proj.weight.view(self.embed_dim, -1),
+            self.proj.bias,
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
-        return hidden_states
 
 
 class Qwen3_5VisionPatchMerger(nn.Module):

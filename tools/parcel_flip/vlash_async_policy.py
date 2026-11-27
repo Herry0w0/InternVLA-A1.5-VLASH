@@ -417,6 +417,8 @@ class VLASHAsyncInternVLAPolicy:
         vlm_model_path: str | None = None,
         device: str = "cuda",
         inference_backend: str = "optimized",
+        w8a16_action_expert: bool = True,
+        use_cuda_graph: bool = True,
         fps: float = 30.0,
         n_action_steps: int | None = None,
         fixed_delay_steps: int | None = None,
@@ -443,6 +445,9 @@ class VLASHAsyncInternVLAPolicy:
             cfg.vlm_model_name_or_path = vlm_model_path
         cfg.action_loss_only = True
         cfg.inference_backend = inference_backend
+        if inference_backend == "flashrt":
+            cfg.flashrt_w8a16_action_expert = bool(w8a16_action_expert)
+            cfg.flashrt_use_cuda_graph = bool(use_cuda_graph)
         cfg.device = device
 
         policy = InternVLAA15Policy.from_pretrained(ckpt_path, config=cfg)
@@ -468,9 +473,9 @@ class VLASHAsyncInternVLAPolicy:
         max_prompt_length = int(ds_cfg.get("max_prompt_length", 650))
         eval_output_tag = str(ds_cfg.get("eval_output_tag", "<Action>"))
 
-        # Constant eval padding length prevents InternVLAA15Optimized from recapturing a new
+        # Constant eval padding length prevents CUDA-Graphed backends from recapturing a new
         # CUDA Graph every time digitized state/delay text token counts fluctuate.
-        if eval_pad_length is None and inference_backend == "optimized":
+        if eval_pad_length is None and inference_backend in ("optimized", "flashrt"):
             eval_pad_length = 512 if enable_head_history else 416
 
         # Load stats saved in checkpoint (or fallback to dataset root in train_config.json)

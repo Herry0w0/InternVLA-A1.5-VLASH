@@ -865,6 +865,10 @@ class InternVLAA15(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.qwen3_5_with_expert.action_expert.config._attn_implementation = "eager"
 
+        expert_dtype = self.qwen3_5_with_expert.action_expert.layers[0].mlp.up_proj.weight.dtype
+        if suffix_embs.dtype != expert_dtype:
+            suffix_embs = suffix_embs.to(dtype=expert_dtype)
+
         outputs_embeds, _ = self.qwen3_5_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1015,6 +1019,10 @@ class InternVLAA15(nn.Module):
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.qwen3_5_with_expert.action_expert.config._attn_implementation = "eager"
+
+        expert_dtype = self.qwen3_5_with_expert.action_expert.layers[0].mlp.up_proj.weight.dtype
+        if suffix_embs.dtype != expert_dtype:
+            suffix_embs = suffix_embs.to(dtype=expert_dtype)
 
         outputs_embeds, _ = self.qwen3_5_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -1393,7 +1401,13 @@ class InternVLAA15Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        if config.inference_backend == "optimized":
+        if config.inference_backend == "flashrt":
+            from lerobot.policies.internvla_a1_5.modeling_internvla_a1_5_flashrt import (
+                InternVLAA15FlashRT,
+            )
+
+            self.model = InternVLAA15FlashRT(config)
+        elif config.inference_backend == "optimized":
             from lerobot.policies.internvla_a1_5.modeling_internvla_a1_5_optimized import (
                 InternVLAA15Optimized,
             )

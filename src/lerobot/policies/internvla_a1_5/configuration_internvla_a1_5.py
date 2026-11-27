@@ -399,7 +399,9 @@ class InternVLAA15Config(PreTrainedConfig):
     block_action_attend_fast_tokens: bool = True
 
     inference_action_type: str = "fm"  # "fm" for flow matching, "fast" for fast-token supervision
-    inference_backend: str = "standard"  # "standard" or "optimized"
+    inference_backend: str = "standard"  # "standard", "optimized", or "flashrt"
+    flashrt_w8a16_action_expert: bool = True  # Use SM87 W8A16 weight-only INT8 skinny GEMM on Action Expert
+    flashrt_use_cuda_graph: bool = True  # Capture full ViT+VLM+LT and 10-step Denoise CUDA Graphs
 
     # Use SDPA (scaled_dot_product_attention) instead of eager attention in training
     use_sdpa: bool = False
@@ -436,13 +438,13 @@ class InternVLAA15Config(PreTrainedConfig):
             raise ValueError(
                 f"action_token_min ({self.action_token_min}) must be <= action_token_max ({self.action_token_max})"
             )
-        if self.inference_backend not in {"standard", "optimized"}:
+        if self.inference_backend not in {"standard", "optimized", "flashrt"}:
             raise ValueError(
-                "inference_backend must be either 'standard' or 'optimized', "
+                "inference_backend must be 'standard', 'optimized', or 'flashrt', "
                 f"got {self.inference_backend!r}"
             )
-        if self.inference_backend == "optimized" and not self.action_loss_only:
-            raise ValueError("inference_backend='optimized' requires action_loss_only=True")
+        if self.inference_backend in {"optimized", "flashrt"} and not self.action_loss_only:
+            raise ValueError(f"inference_backend={self.inference_backend!r} requires action_loss_only=True")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

@@ -38,8 +38,8 @@ dataset:
 
   # ---- VLASH 时移微调 + 显式延迟条件 + 固定跨度 WAN 前瞻 ----
   vlash_enabled: true
-  vlash_min_delay_steps: 1        # Orin 实测真实延迟后可围绕实测值收窄 [min, max]
-  vlash_max_delay_steps: 12       # 30Hz 下覆盖最高 400ms 推理延迟
+  vlash_min_delay_steps: 1        # Orin FlashRT 实测空载 274ms@10步 / 212ms@5步（真机 SDK 在场约 270-360ms -> 8-11 步）
+  vlash_max_delay_steps: 12       # 30Hz 下覆盖最高 400ms 推理延迟（完美覆盖 Orin FlashRT 空载及真机 SDK 抖动余量）
   vlash_zero_delay_prob: 0.1      # 10% 概率 δ=0（贴近原论文均匀分布并保留冷启动），90% 均匀采样 [min, max]
   vlash_condition_on_delay: true  # 在 VLM 提示词中显式注入 "; Delay: <δ>"，解决静态臂拦截动态包裹的不可辨识性
   vlash_use_state_ground_truth: false  # 对齐官方 VLASH：δ=0 用真实传感器 s_t，δ>0 用前一步指令 a_{t+δ-1}，消除 Galbot ~2 帧伺服滞后失配

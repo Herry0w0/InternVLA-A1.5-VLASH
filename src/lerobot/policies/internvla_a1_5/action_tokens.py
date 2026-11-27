@@ -79,7 +79,10 @@ def ensure_qwen35_action_tokens(tokenizer, model: nn.Module | None = None) -> No
         target_size = max(target_size, old_size + NUM_ACTION_TOKENS)
 
     if old_size < target_size:
-        model.resize_token_embeddings(target_size)
+        # New rows are immediately overwritten by _init_new_rows below; disable HF's
+        # default multivariate-normal mean_resizing which computes a 248k x 2048 CPU
+        # covariance/Cholesky matrix (very slow on ARM and fails on LAPACK-less PyTorch builds).
+        model.resize_token_embeddings(target_size, mean_resizing=False)
         _init_new_rows(model.get_input_embeddings().weight, old_size)
         lm_head = getattr(model, "lm_head", None)
         if lm_head is not None and lm_head.weight.shape[0] == target_size:
